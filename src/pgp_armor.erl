@@ -7,7 +7,8 @@
 %%% Created : 29 Apr 2021 by Tony Rogvall <tony@rogvall.se>
 
 -module(pgp_armor).
--export([decode/1, encode/1]).
+-export([decode/1]).
+-export([encode_message/1, encode_pubkey/1]).
 
 -define(CRC24_INIT, 16#B704CE).
 -define(CRC24_POLY, 16#1864CFB).
@@ -16,6 +17,9 @@
 -define(PGP_PUBKEY_FOOTER, <<"-----END PGP PUBLIC KEY BLOCK-----">>).
 -define(PGP_PRIKEY_HEADER, <<"-----BEGIN PGP PRIVATE KEY BLOCK-----">>).
 -define(PGP_PRIKEY_FOOTER, <<"-----END PGP PRIVATE KEY BLOCK-----">>).
+-define(PGP_MESSAGE_HEADER, <<"-----BEGIN PGP MESSAGE-----">>).
+-define(PGP_MESSAGE_FOOTER, <<"-----END PGP MESSAGE-----">>).
+
 -define(PGP_VERSION_PREFIX, "Version: ").
 -define(PGP_COMMENT_PREFIX, "Comment: ").
 
@@ -39,6 +43,8 @@ keylines([?PGP_PUBKEY_HEADER | Rest]) ->
     keylines(Rest, [{type,public}], [], no_sum);
 keylines([?PGP_PRIKEY_HEADER | Rest]) ->
     keylines(Rest, [{type,private}], [], no_sum);
+keylines([?PGP_MESSAGE_HEADER | Rest]) ->
+    keylines(Rest, [{type,message}], [], no_sum);
 keylines([_ | Lines]) ->
     keylines(Lines);
 keylines([]) ->
@@ -68,16 +74,26 @@ keylines([?PGP_PRIKEY_FOOTER | _], Opt, Acc, CRC) ->
 	_ ->
 	    {error, bad_footer}
     end;
+keylines([?PGP_MESSAGE_FOOTER | _], Opt, Acc, CRC) ->
+    {Opt, iolist_to_binary(lists:reverse(Acc)), CRC};
 keylines([Line | Rest], Opt, Acc, CRC) ->
     keylines(Rest, Opt, [Line | Acc], CRC).
 
-encode(KeyData) ->
+encode_message(Data) ->
+    [?PGP_MESSAGE_HEADER, $\n,
+     encode_content(Data),
+     ?PGP_MESSAGE_FOOTER, $\n].
+
+encode_pubkey(Data) ->
     [?PGP_PUBKEY_HEADER, $\n,
-     ?PGP_VERSION_PREFIX, ?EKS_BANNER, $\n,
+     encode_content(Data),
+     ?PGP_PUBKEY_FOOTER, $\n].
+
+encode_content(Data) ->
+    [%%?PGP_VERSION_PREFIX, ?EKS_BANNER, $\n,
      $\n,
-     encode_lines(base64:encode(KeyData)), $\n,
-     $=, crc24b64(KeyData), $\n,
-     ?PGP_PUBKEY_FOOTER].
+     encode_lines(base64:encode(Data)), $\n,
+     $=, crc24b64(Data), $\n].
 
 encode_lines(Data) ->
     encode_lines(Data, []).

@@ -12,7 +12,20 @@
 decode_file(Filename) ->
     {ok,Bin} = file:read_file(Filename),
     case pgp_armor:decode(Bin) of
-	{ok, Opts, Data} ->
+	{ok, _Opts, Data} ->
 	    pgp_parse:decode_stream(Data)
     end.
 
+encode_file(Filename, Packets) ->
+    encode_file(Filename, Packets, #{}).
+    
+encode_file(Filename, Packets, Context) ->
+    Data = encode_packets(Packets, Context),
+    file:write_file(Filename, pgp_armor:encode_message(Data)).
+
+encode(Packets, Context) ->
+    Data = encode_packets(Packets, Context),    
+    pgp_armor:encode_message(Data).
+
+encode_packets(Packets, Context) ->
+    pgp_parse:encode_packets(Packets, Context).

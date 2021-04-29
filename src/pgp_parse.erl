@@ -59,7 +59,6 @@
 -define(FEATURES, 30).
 -define(ISSUER_FINGERPRINT, 33).
 
-
 %% Section 9.5: Hash Algorithms
 -define(HASH_ALGORITHM_MD5, 1).
 -define(HASH_ALGORITHM_SHA1, 2).
@@ -235,13 +234,14 @@ decode_stream(Data, Options) ->
     Handler = proplists:get_value(handler, Options, fun default_handler/3),
     HandlerState = proplists:get_value(handler_state, Options, []),
     Context = new_context(Handler, HandlerState),
-    decode_packets(DecodedPackets, Context).
+    Context1 = decode_packets(DecodedPackets, Context),
+    maps:get(handler_state, Context1).
 
-default_handler(begin_subpackets, _Params, Stack) ->
+default_handler(push, _Params, Stack) ->
     [mark | Stack];
-default_handler(end_subpackets, _Params, Stack) ->
+default_handler(pop, _Params, Stack) ->
     {Elems,Stack1} = collect_until_mark(Stack,[]),
-    [{subpackets,Elems} | Stack1];
+    [{list,Elems} | Stack1];
 default_handler(PacketType, Params, Stack) ->
     [{PacketType,Params} | Stack].
 
@@ -301,6 +301,34 @@ encode_signatures(Signatures) ->
     << <<(encode_old_packet(?SIGNATURE_PACKET, S))/binary>> || 
 	S <- Signatures >>.
 
+encode_packets(Packets, Context) ->
+    iolist_to_binary([encode(P,Context) || P <- Packets]).
+
+encode({literal_data,#{ format := Format,
+		       value := Data }}, _Context) ->
+    encode_packet(?LITERAL_DATA_PACKET, <<Format,Data/binary>>);
+encode({compressed,Packets}, Context) ->
+    Data = encode_packets(Packets, Context),
+    Default = [zip,uncompressed],
+    Algorithms = maps:get(preferred_compression_algorithms,Context,Default),
+    compress_packet(Algorithms, Data).
+	    
+		  
+compress_packet(Algorithms, Data) ->
+    case Algorithms of
+	[uncompressed|_] ->
+	    encode_packet(?COMPRESSED_PACKET,
+			  <<?COMPRESS_UNCOMPRESSED,Data/binary>>);
+	[zip|_] ->
+	    encode_packet(?COMPRESSED_PACKET,
+			  <<?COMPRESS_ZIP,(zlib:zip(Data))/binary>>);
+	[zlib|_] ->
+	    encode_packet(?COMPRESSED_PACKET,
+			  <<?COMPRESS_ZIP,(zlib:compress(Data))/binary>>);
+	[_|Rest] -> %% prefered not suppored try next
+	    compress_packet(Rest, Data)
+    end.
+
 %%
 %% Encode packet
 %%
@@ -350,7 +378,7 @@ encode_chunked_body(Data, Exp, Acc) when Exp < 32 ->
 %%
 
 decode_packets(<<>>, Context) ->
-    maps:get(handler_state, Context);
+    Context;
 %% Section 4.2.1: Old Format Packet Lengths
 decode_packets(<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data/binary>>,
                Context) ->
@@ -458,10 +486,10 @@ decode_packet(?SIGNATURE_PACKET,
         end,
     <<SignedHashLeft16:2/binary, _/binary>> = Expected,
 
-    Context1 = callback(begin_subpackets, #{}, Context),
+    Context1 = callback(push, #{}, Context),
     Context2 = decode_signed_subpackets(HashedSubpackets, Context1),
     Context3 = decode_signed_subpackets(UnhashedSubpackets, Context2),
-    Context4 = callback(end_subpackets, #{}, Context3),
+    Context4 = callback(pop, #{}, Context3),
 
     %% callback signature fail / success?
     Verified =
@@ -506,7 +534,7 @@ decode_packet(?USER_ID_PACKET, UserId, Context) ->
 		       user_attribute => undefined });
 decode_packet(?COMPRESSED_PACKET, <<Algorithm,Data/binary>>, Context) ->
     case compression(Algorithm) of
-	none ->
+	uncompressed ->
 	    decode_packets(Data, Context);
 	zip ->
 	    decode_packets(zlib:unzip(Data), Context);
@@ -527,6 +555,9 @@ decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
     %% then recursive decrypt 
     callback(encrypted_protected, #{ version => Version,
 				     value => Data }, Context).
+
+
+
 
 %% version 4
 decode_key_4(key, Data, Context) ->
@@ -833,7 +864,7 @@ crypto_cipher(?ENCRYPT_TWOFISH) -> {unknown,twofish};
 crypto_cipher(X) -> {unknown,X}.
 
 
-compression(?COMPRESS_UNCOMPRESSED) -> none;
+compression(?COMPRESS_UNCOMPRESSED) -> uncompressed;
 compression(?COMPRESS_ZIP) -> zip;
 compression(?COMPRESS_ZLIB) -> zlib;
 compression(?COMPRESS_BZIP2) -> bzip2;
