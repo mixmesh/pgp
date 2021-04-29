@@ -21,22 +21,27 @@
 %% Section references can be found in
 %% https://tools.ietf.org/pdf/draft-ietf-openpgp-rfc4880bis-10.pdf
 
--define(PGP_VERSION_4, 4).
+%% -define(PGP_VERSION_4, 4).
+-define(SIG_VERSION_4, 4).
+-define(KEY_VERSION_4, 4).
 
 %% Section 4.2: Packets Headers
 -define(OLD_PACKET_FORMAT, 2#10).
 -define(NEW_PACKET_FORMAT, 2#11).
 
 %% Section 4.3: Packets Tags
+-define(PUBLIC_KEY_ENCRYPTED_PACKET, 1).
 -define(SIGNATURE_PACKET, 2).
 -define(SECRET_KEY_PACKET, 5).
 -define(PUBLIC_KEY_PACKET, 6).
 -define(SECRET_SUBKEY_PACKET, 7).
 -define(COMPRESSED_PACKET,    8).
 -define(ENCRYPTED_PACKET, 9).
+-define(LITERAL_DATA_PACKET, 10).
 -define(USER_ID_PACKET, 13).
 -define(PUBLIC_SUBKEY_PACKET, 14).
 -define(USER_ATTRIBUTE_PACKET, 17).
+-define(ENCRYPTED_PROTECTED_PACKET, 18).
 
 %% Section 5.2.3.1: Signature Subpacket Specification
 -define(SIGNATURE_CREATION_TIME_SUBPACKET, 2).
@@ -227,35 +232,25 @@ decode_stream(Data, Options) ->
             false ->
                 Packets
         end,
-    Handler =
-        proplists:get_value(
-          handler, Options,
-          fun(PacketType, Params, Stack) ->
-		  [{PacketType,Params} | Stack]
-          end),
+    Handler = proplists:get_value(handler, Options, fun default_handler/3),
     HandlerState = proplists:get_value(handler_state, Options, []),
     Context = new_context(Handler, HandlerState),
     decode_packets(DecodedPackets, Context).
 
-%% Exported: decode_public_key
+default_handler(begin_subpackets, _Params, Stack) ->
+    [mark | Stack];
+default_handler(end_subpackets, _Params, Stack) ->
+    {Elems,Stack1} = collect_until_mark(Stack,[]),
+    [{subpackets,Elems} | Stack1];
+default_handler(PacketType, Params, Stack) ->
+    [{PacketType,Params} | Stack].
 
-decode_public_key(<<?PGP_VERSION_4,Timestamp:32,Algorithm,KeyRest/binary>>) ->
-    Key = decode_public_key_algorithm(Algorithm, KeyRest),
-    {Timestamp, Key#{ creation => timestamp_to_datetime(Timestamp) }}.
-
-decode_public_key_algorithm(?PUBLIC_KEY_ALGORITHM_ELGAMAL, Data) ->
-    [P, G, Y] = read_mpi(Data, 3),
-    #{ type => elgamal, p=>P, g=>G, y=>Y };
-decode_public_key_algorithm(?PUBLIC_KEY_ALGORITHM_DSA, Data) ->
-    [P,Q,G,Y] = read_mpi(Data, 4),
-    #{ type => dss, p=>P, q=>Q, g=>G, y=>Y };
-decode_public_key_algorithm(RSA, Data)
-  when RSA =:= ?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN orelse
-       RSA =:= ?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT orelse
-       RSA =:= ?PUBLIC_KEY_ALGORITHM_RSA_SIGN ->
-    [N,E] = read_mpi(Data, 2),
-    #{ type => rsa, e=>E, n=>N }.
-
+collect_until_mark([mark|Stack],Acc) ->
+    {Acc, Stack};
+collect_until_mark([Elem|Stack],Acc) ->
+    collect_until_mark(Stack,[Elem|Acc]);
+collect_until_mark([],Acc) -> %% warning? error?
+    {Acc,[]}.
 
 %% Exported: decode_signature_packet
 
@@ -322,18 +317,34 @@ encode_old_packet(Tag, Body) ->
 	    <<?OLD_PACKET_FORMAT:2,Tag:4,2:2,Len:32,Body/binary>>
     end.
 
-encode_new_packet(_, undefined) ->
+encode_packet(_, undefined) ->
     <<>>;
-encode_new_packet(Tag, Body) ->
-    Len = byte_size(Body),
+encode_packet(Tag, Body) ->
+    Data = encode_body(Body),
+    <<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>.
+
+encode_body(Data)  ->
+    Len = byte_size(Data),
     if Len =< 192 ->
-	    <<?NEW_PACKET_FORMAT:2, Tag:6, Len, Body/binary>>;
-       Len < 8000 ->
-	    <<?NEW_PACKET_FORMAT:2, Tag:6, 2#110:3,(Len-192):13,Body/binary>>;
+	    <<Len, Data/binary>>;
+       Len =< 8383 ->
+	    <<2#110:3,(Len-192):13,Data/binary>>;
        true ->
-	    <<?NEW_PACKET_FORMAT:2, Tag:6, 2#11111111,Len:32,Body/binary>>
+	    <<2#111:3,2#11111:5,Len:32,Data/binary>>
     end.
 
+%% Exp is power of two exponent, sizes allowed are
+%%   2^0=1,2^1=2...2^31 = 2147483648
+encode_chunked_body(Data, Exp) ->
+    encode_chunked_body(Data, Exp, []).
+encode_chunked_body(Data, Exp, Acc) when Exp < 32 ->
+    case Data of
+	<<Chunk:(1 bsl Exp)/binary, Data1/binary>> ->
+	    encode_chunked_body(Data1, Exp, [Chunk,<<2#111:3,Exp:5>>|Acc]);
+	_ ->
+	    iolist_to_binary(lists:reverse([encode_body(Data)|Acc]))
+    end.
+    
 %%
 %% Decode packets
 %%
@@ -348,21 +359,33 @@ decode_packets(<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data/binary>>,
     decode_packets(Data1, NewContext);
 %% Section 4.2.2: New Format Packet Lengths
 decode_packets(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>, Context) ->
-    {Packet, Data1} =  decode_new_body(Data),
+    {Packet, Data1} =  decode_body(Data),
     NewContext = decode_packet(Tag, Packet, Context),
     decode_packets(Data1, NewContext).
 
-decode_new_packet(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>) ->
-    {Packet,Data1} = decode_new_body(Data),
+decode_packet(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>) ->
+    {Packet,Data1} = decode_body(Data),
     {{Tag,Packet},Data1}.
 
-decode_new_body(<<2#110:3,Len:13,Packet:(Len+192)/binary,Rest/binary>>) ->
+decode_body(<<2#110:3,Len:13,Packet:(Len+192)/binary,Rest/binary>>) ->
     {Packet, Rest};
-decode_new_body(<<2#111:3,2#11111:5,Len:32,Packet:Len/binary,Rest/binary>>) ->
+decode_body(<<2#111:3,2#11111:5,Len:32,Packet:Len/binary,Rest/binary>>) ->
     {Packet, Rest};
+decode_body(<<2#111:3,Exp:5,Partial:(1 bsl Exp)/binary,Rest/binary>>) ->
+    decode_body_parts(Rest, [Partial]);
 %% 00/01/10
-decode_new_body(<<Len:8,Packet:Len/binary,Rest/binary>>) ->
+decode_body(<<Len:8,Packet:Len/binary,Rest/binary>>) ->
     {Packet, Rest}.
+
+decode_body_parts(<<2#110:3,Len:13,Packet:(Len+192)/binary,Rest/binary>>,Ps) ->
+    {iolist_to_binary(lists:reverse([Packet|Ps])),Rest};
+decode_body_parts(<<2#111:3,2#11111:5,Len:32,Packet:Len/binary,Rest/binary>>,Ps) ->
+    {iolist_to_binary(lists:reverse([Packet|Ps])),Rest};
+decode_body_parts(<<2#111:3,Exp:5,Partial:(1 bsl Exp)/binary,Rest/binary>>,Ps) ->
+    decode_body_parts(Rest,[Partial|Ps]);
+decode_body_parts(<<Len:8,Packet:Len/binary,Rest/binary>>,Ps) ->
+    {iolist_to_binary(lists:reverse([Packet|Ps])),Rest}.
+
 
 %%decode_new_packet(<<2#00:2,Len:6,Packet:Len/binary,Rest/binary>>) ->
 %%    {Packet, Rest};
@@ -398,10 +421,22 @@ decode_new_packet0(<<255, Length:32, Packet:Length/binary,
     %% Five octet packet length
     {Packet, RemainingPackets}.
 
-
+%% Section 5.1: Public-Key Encrypted Session Key Packet (Tag 2)
+decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
+	      <<?KEY_VERSION_4,
+		KeyID:8/binary, %% key or subkey
+                Algorithm,
+		Data/binary>>,
+	      Context) ->
+    Alg = pubkey_alg(Algorithm),
+    callback(public_key_encrypted, 
+	     #{ algorith => Alg, 
+		keyid => KeyID,
+		value => Data },
+	     Context);
 %% Section 5.2: Signature Packet (Tag 2)
 decode_packet(?SIGNATURE_PACKET,
-              <<?PGP_VERSION_4,
+              <<?SIG_VERSION_4,
                 SignatureType,
                 PublicKeyAlgorithm,
                 HashAlgorithm,
@@ -422,17 +457,17 @@ decode_packet(?SIGNATURE_PACKET,
                   HashedSubpackets, Context)
         end,
     <<SignedHashLeft16:2/binary, _/binary>> = Expected,
-    ContextAfterHashedSubpackets =
-        decode_signed_subpackets(HashedSubpackets, Context),
-    ContextAfterUnhashedSubpackets =
-        decode_signed_subpackets(UnhashedSubpackets,
-                                 ContextAfterHashedSubpackets),
+
+    Context1 = callback(begin_subpackets, #{}, Context),
+    Context2 = decode_signed_subpackets(HashedSubpackets, Context1),
+    Context3 = decode_signed_subpackets(UnhashedSubpackets, Context2),
+    Context4 = callback(end_subpackets, #{}, Context3),
 
     %% callback signature fail / success?
     Verified =
 	verify_signature_packet(
 	  PublicKeyAlgorithm, HashAlgorithm, Expected, Signature, SignatureType,
-	  ContextAfterUnhashedSubpackets),
+	  Context4),
 
     SignatureLevel = signature_type_to_signature_level(SignatureType),
 
@@ -447,35 +482,16 @@ decode_packet(?SIGNATURE_PACKET,
 	      issuer,
 	      key_creation,
 	      key_expiration],
-	     ContextAfterUnhashedSubpackets);
+	     Context4);
 %% Section 5.5.1.1: Public-Key Packet (Tag 6)
 %% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
-decode_packet(Tag, KeyData, Context)
-  when Tag =:= ?PUBLIC_KEY_PACKET orelse Tag =:= ?PUBLIC_SUBKEY_PACKET ->
-    {CreationStamp, Key} = decode_public_key(KeyData),
-    C14NKey = c14n_key(KeyData),
-    case Tag of
-        ?PUBLIC_KEY_PACKET ->
-	    callback(key, 
-		     #{ key => Key,
-			key_data => C14NKey
-		      }, 
-		     Context#{ key => Key,
-			       key_creation => CreationStamp,
-			       key_data => C14NKey });
-        ?PUBLIC_SUBKEY_PACKET ->
-	    #{ key := PrimaryKey } = Context,
-	    callback(subkey,
-		     #{ subkey => Key,
-			subkey_data => C14NKey,
-			key => PrimaryKey
-		      },
-		     [user_id],
-		     Context#{ subkey => Key,
-			       subkey_creation => CreationStamp,
-			       subkey_data => C14NKey
-			     })
-    end;
+decode_packet(?PUBLIC_KEY_PACKET, 
+	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+    decode_key_4(key,Data,Context);
+decode_packet(?PUBLIC_SUBKEY_PACKET, 
+	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+    decode_key_4(subkey,Data,Context);
+
 %% Section 5.13: User Attribute Packet (Tag 17)
 decode_packet(?USER_ATTRIBUTE_PACKET, UserAttribute, Context) ->
     Value = <<16#D1,(byte_size(UserAttribute)):32,UserAttribute/binary>>,
@@ -487,7 +503,75 @@ decode_packet(?USER_ID_PACKET, UserId, Context) ->
     Value = <<16#B4, (byte_size(UserId)):32, UserId/binary>>,
     callback(user_id, #{ value => UserId },
 	     Context#{ user_id => Value,
-		       user_attribute => undefined }).
+		       user_attribute => undefined });
+decode_packet(?COMPRESSED_PACKET, <<Algorithm,Data/binary>>, Context) ->
+    case compression(Algorithm) of
+	none ->
+	    decode_packets(Data, Context);
+	zip ->
+	    decode_packets(zlib:unzip(Data), Context);
+	zlib ->
+	    decode_packets(zlib:uncompress(Data), Context);
+	bzip2 ->
+	    ?err("error bzip2: not_implemented\n", []),
+	    Context
+    end;
+decode_packet(?LITERAL_DATA_PACKET, <<Format,Data/binary>>, Context) ->
+    %% convert format=$t line-endings?
+    callback(literal_data, #{ format => Format, value => Data }, Context);
+decode_packet(?ENCRYPTED_PACKET, Data, Context) ->
+    %% FIXME: decrypt if secret key is available and recursive decode
+    callback(encrypted, #{ value => Data }, Context);
+decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
+    %% FIXME: decrypt if secret key is available and packet is valid
+    %% then recursive decrypt 
+    callback(encrypted_protected, #{ version => Version,
+				     value => Data }, Context).
+
+%% version 4
+decode_key_4(key, Data, Context) ->
+    {CreationStamp, Key} = decode_public_key(Data),
+    C14NKey = c14n_key(Data),
+    callback(key, 
+	     #{ key => Key,
+		key_data => C14NKey
+	      }, 
+	     Context#{ key => Key,
+		       key_creation => CreationStamp,
+		       key_data => C14NKey });
+decode_key_4(subkey, Data, Context = #{ key := PrimaryKey }) ->
+    {CreationStamp, Key} = decode_public_key(Data),
+    C14NKey = c14n_key(Data),
+    callback(subkey,
+	     #{ subkey => Key,
+		subkey_data => C14NKey,
+		key => PrimaryKey
+	      },
+	     [user_id],
+	     Context#{ subkey => Key,
+		       subkey_creation => CreationStamp,
+		       subkey_data => C14NKey
+		     }).
+
+
+decode_public_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
+    Creation = timestamp_to_datetime(Timestamp),
+    Key = case pubkey_alg(Algorithm) of
+	      elgamal ->
+		  [P, G, Y] = read_mpi(Data, 3),
+		  #{ type => elgamal, creation => Creation,
+		     p=>P, g=>G, y=>Y };
+	      dsa ->
+		  [P,Q,G,Y] = read_mpi(Data, 4),
+		  #{ type => dss, creation => Creation,
+		     p=>P, q=>Q, g=>G, y=>Y }; %% name is dss
+	      rsa ->
+		  [N,E] = read_mpi(Data, 2),
+		  #{ type => rsa, creation => Creation,
+		     e=>E, n=>N }
+	  end,
+    {Timestamp, Key}.
+
 %%
 %% Signature packet handling
 %%
@@ -527,13 +611,13 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlgorithm,
                 HashState
         end,
     FinalData =
-        <<?PGP_VERSION_4,
+        <<?SIG_VERSION_4,
           SignatureType,
           PublicKeyAlgorithm,
           HashAlgorithm,
           (byte_size(HashedSubpackets)):16,
           HashedSubpackets/binary>>,
-    Trailer = <<?PGP_VERSION_4, 16#FF, (byte_size(FinalData)):32>>,
+    Trailer = <<?SIG_VERSION_4, 16#FF, (byte_size(FinalData)):32>>,
     crypto:hash_final(
       crypto:hash_update(
         crypto:hash_update(FinalHashState, FinalData), Trailer)).
@@ -542,7 +626,7 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlgorithm,
 decode_signed_subpackets(<<>>, Context) ->
     Context;
 decode_signed_subpackets(Packets, Context) ->
-    {Payload, Rest} = decode_new_body(Packets),
+    {Payload, Rest} = decode_body(Packets),
     NewContext = decode_signed_subpacket(Payload, Context),
     decode_signed_subpackets(Rest, NewContext#{critical_subpacket => false}).
 
@@ -754,7 +838,12 @@ compression(?COMPRESS_ZIP) -> zip;
 compression(?COMPRESS_ZLIB) -> zlib;
 compression(?COMPRESS_BZIP2) -> bzip2;
 compression(X) -> {unknown,X}.
-    
+
+pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN) -> rsa;
+pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT) -> rsa;
+pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_SIGN) -> rsa;
+pubkey_alg(?PUBLIC_KEY_ALGORITHM_DSA) -> dsa;
+pubkey_alg(?PUBLIC_KEY_ALGORITHM_ELGAMAL) -> elgamal.
 
 %% get specified fields from map
 fields([F|Fs], Map) ->
@@ -804,9 +893,13 @@ timestamp_to_local_datetime(Timestamp) ->
 test_packets() ->
     lists:foreach(
       fun(Len) ->
+	      io:format("Len: ~w\n",[Len]),
 	      Packet = << <<(rand:uniform(256)-1)>> || _ <- lists:seq(1,Len) >>,
-	      New = encode_new_packet(61, Packet),
-	      {{61,Packet},<<>>} = decode_new_packet(New),
+	      New = encode_packet(61, Packet),
+	      {{61,Packet},<<>>} = decode_packet(New),
+	      ChunkedBody = encode_chunked_body(Packet, 4),
+	      Chunked = <<?NEW_PACKET_FORMAT:2, 62:6, ChunkedBody/binary>>,
+	      {{62,Packet},<<>>} = decode_packet(Chunked),
 	      Old = encode_old_packet(13, Packet),
 	      {{13,Packet},<<>>} = decode_old_packet(Old)
       end, lists:seq(1, 1000)++[65535,70000,1000000]).
