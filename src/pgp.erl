@@ -20,12 +20,60 @@ encode_file(Filename, Packets) ->
     encode_file(Filename, Packets, #{}).
     
 encode_file(Filename, Packets, Context) ->
-    Data = encode_packets(Packets, Context),
+    {Data,_Context} = encode_packets(Packets, Context),
     file:write_file(Filename, pgp_armor:encode_message(Data)).
 
 encode(Packets, Context) ->
-    Data = encode_packets(Packets, Context),    
+    {Data,_Context} = encode_packets(Packets, Context),    
     pgp_armor:encode_message(Data).
 
 encode_packets(Packets, Context) ->
     pgp_parse:encode_packets(Packets, Context).
+
+%%
+%% Test code to create signed key
+%%
+make_pubkey_packet() ->
+    %% {_Public,Private} = pgp_keys:generate_dss_key(),  %% test key
+    {_Public,Private} = pgp_keys:generate_rsa_key(),  %% test key
+    make_pubkey_packet(Private).
+
+make_pubkey_packet(SigningKey) ->
+    _SubKey = {Public,_Private} = pgp_keys:generate_mixmesh_key(1024),
+    make_pubkey_packet(SigningKey, Public).
+
+make_pubkey_packet(SigningKey, SubKey) ->
+    DateTime = utc_datetime(),
+    Packets = 
+	[{key, #{ key => SigningKey }},
+	 {user_id, #{ value => <<"Tony Rogvall (mixmesh) <tony@rogvall.se>">>}},
+	 {signature, #{ signature_type => 16#13,  %% certification
+			hash_algorithm => sha256,
+			hashed => [{issuer_fingerprint,self},
+				   {signature_creation_time,
+				    #{ value => DateTime}},
+				   {key_flags,#{ value => <<3>> }}
+				  ],
+			unhashed => [{issuer, self}] }},
+	 {subkey, #{ subkey => SubKey }},
+	 {signature, #{ signature_type => 16#18,  %% subkey binding
+			hash_algorithm => sha256,
+			hashed => [{issuer_fingerprint,primary},
+				   {signature_creation_time,
+				    #{ value => DateTime}},
+				   {key_flags,#{ value => <<12>> }}
+				  ],
+			unhashed => [{issuer, primary}] }}
+	],
+    {Data, _Context} = pgp_parse:encode_packets(Packets, #{}),
+    pgp_armor:encode_pubkey(Data).
+
+utc_datetime() ->
+    case calendar:local_time_to_universal_time_dst({date(),time()}) of
+	[DateTime] -> DateTime;
+	[_, DateTime] -> DateTime;
+	[] -> calendar:local_time()  %% need a value that is not zero!!!
+    end.
+
+local_datetime() ->
+    calendar:local_time().

@@ -34,7 +34,8 @@ generate_rsa_key(ModulusSizeInBits, PublicExponent) ->
     {[E,N],[E, N, D, P1, P2, _E1, _E2, C]} =
 	crypto:generate_key(rsa, {ModulusSizeInBits, PublicExponent}),
     Public = #{ type => rsa,
-		create => calendar:universal_time(),
+		use => [encrypt,sign],
+		creation => calendar:universal_time(),
 		e => binary:decode_unsigned(E, big),
 		n => binary:decode_unsigned(N, big) },
     Private = Public#{ d => binary:decode_unsigned(D, big),
@@ -60,9 +61,8 @@ generate_mixmesh_key(1024) ->
     generate_mixmesh_key(P,G).
 
 generate_mixmesh_key(P,G) ->
-    generate_dh_key(elgamal, P,(P-1) div 2, G).
+    generate_dh_key__(elgamal, [encrypt], P,(P-1) div 2, G).
     
-
 generate_elgamal_key() ->
     generate_elgamal_key(2048).
 
@@ -71,7 +71,7 @@ generate_elgamal_key() ->
 
  %% FIXME: only when dh key P is safe prime (Q = (P-1) div 2)
 generate_elgamal_key(Size) ->
-    generate_dh_key_(elgamal, Size).
+    generate_dh_key_(elgamal, [encrypt], Size).
 
 generate_dss_key() ->
     generate_dss_key(2048).
@@ -80,23 +80,23 @@ generate_dss_key() ->
 	  {public_dss(), private_dss()}.
 
 generate_dss_key(Size) ->
-    generate_dh_key_(dss, Size).
+    generate_dh_key_(dss, [sign], Size).
 
-generate_dh_key_(Type,Size) ->
+generate_dh_key_(Type, Use, Size) ->
     ID = dh_size_to_group(Size),
     G = dh_group_to_g(ID),
     P = dh_group_to_p(ID),
     Q = (P-1) div 2,
     P = Q*2+1,  %% validation
-    generate_dh_key(Type, P, Q, G).
+    generate_dh_key__(Type, Use, P, Q, G).
 
-generate_dh_key(Type, P, Q, G) ->
+generate_dh_key__(Type, Use, P, Q, G) ->
     {Yb,Xb} = crypto:generate_key(dh, [P, G]),
     Y = binary:decode_unsigned(Yb, big),
     X = binary:decode_unsigned(Xb, big),
     Y = mpz:powm(G, X, P),  %% validation
-    Public = #{ type => Type,
-		create => calendar:universal_time(),
+    Public = #{ type => Type, use => Use,
+		creation => calendar:universal_time(),
 		p => P,
 		q => Q,
 		g => G,
