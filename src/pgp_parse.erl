@@ -397,6 +397,14 @@ encode({subkey, #{ subkey := Key }}, Context) ->
     KeyData = encode_public_key(Key),
     encode_packet(?PUBLIC_SUBKEY_PACKET, KeyData,
 		  Context#{ subkey => Key, subkey_data => KeyData });
+encode({secret_key, #{ key := Key}}, Context) ->
+    KeyData = encode_secret_key(Key),
+    encode_packet(?SECRET_KEY_PACKET, KeyData, 
+		  Context#{ key => Key, key_data => KeyData });
+encode({secrety_subkey, #{ subkey := Key }}, Context) ->
+    KeyData = encode_secret_key(Key),
+    encode_packet(?SECRET_SUBKEY_PACKET, KeyData,
+		  Context#{ subkey => Key, subkey_data => KeyData });
 encode({user_attribute, #{ value := UserAttribute }}, Context) ->
     Len = byte_size(UserAttribute),
     %% encode for signature/hash
@@ -638,10 +646,19 @@ decode_packet(?SIGNATURE_PACKET,
 %% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
 decode_packet(?PUBLIC_KEY_PACKET, 
 	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
-    decode_key_4(key,Data,Context);
+    decode_public_key_4(key,Data,Context);
 decode_packet(?PUBLIC_SUBKEY_PACKET, 
 	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
-    decode_key_4(subkey,Data,Context);
+    decode_public_key_4(subkey,Data,Context);
+
+%% Section 5.5.1.1: Public-Key Packet (Tag 6)
+%% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
+decode_packet(?SECRET_KEY_PACKET, 
+	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+    decode_secret_key_4(secret_key,Data,Context);
+decode_packet(?SECRET_SUBKEY_PACKET, 
+	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+    decode_secret_key_4(secret_subkey,Data,Context);
 
 %% Section 5.13: User Attribute Packet (Tag 17)
 decode_packet(?USER_ATTRIBUTE_PACKET, UserAttribute, Context) ->
@@ -682,14 +699,14 @@ decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
 				     value => Data }, Context).
 
 %% version 4
-decode_key_4(key, KeyData, Context) ->
+decode_public_key_4(key, KeyData, Context) ->
     Key = decode_public_key(KeyData),
     KeyID = key_id(KeyData),
     callback(key, #{ key => Key,
 		     key_id => KeyID,
 		     key_data => KeyData }, 
 	     Context#{ key => Key, key_data => KeyData });
-decode_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
+decode_public_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
     Key = decode_public_key(KeyData),
     KeyID = key_id(KeyData),
     callback(subkey, #{ subkey => Key, 
@@ -715,21 +732,93 @@ decode_public_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
 	       e=>E, n=>N }
     end.
 
+%% version 4
+decode_secret_key_4(secret_key, KeyData, Context) ->
+    Key = decode_secret_key(KeyData),
+    KeyID = key_id(KeyData), %% fixme? public?
+    callback(secret_key, #{ key => Key,
+			    key_id => KeyID,
+			    key_data => KeyData }, 
+	     Context#{ key => Key, key_data => KeyData });
+decode_secret_key_4(secret_subkey,KeyData,Context = #{ key := PrimaryKey }) ->
+    Key = decode_secret_key(KeyData),
+    KeyID = key_id(KeyData), %% fixme? public?
+    callback(secret_subkey, #{ subkey => Key, 
+			       subkey_id => KeyID,
+			       subkey_data => KeyData,
+			       key => PrimaryKey },
+	     [user_id], Context#{ subkey => Key,
+				  subkey_data => KeyData }).
+
+decode_secret_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
+    Creation = timestamp_to_datetime(Timestamp),
+    case dec_pubkey_alg(Algorithm) of
+	{elgamal,Use} ->
+	    {[P, G, Y], Data1} = decode_mpi_parts(Data, 3),
+	    Data2 = decrypt_secret_key(Data1),
+	    {[X], <<>>} = decode_mpi_parts(Data2, 1),
+	    #{ type => elgamal, use => Use, creation => Creation,
+	       p=>P, g=>G, y=>Y, x=>X };
+	{dsa,Use} ->
+	    {[P,Q,G,Y], Data1} = decode_mpi_parts(Data, 4),
+	    Data2 = decrypt_secret_key(Data1),
+	    {[X], <<>>} = decode_mpi_parts(Data2, 1),
+	    #{ type => dss, use => Use, creation => Creation,
+	       p=>P, q=>Q, g=>G, y=>Y, x=>Y }; %% name is dss
+	{rsa,Use} ->
+	    {[N,E],Data1} = decode_mpi_parts(Data, 2),
+	    Data2 = decrypt_secret_key(Data1),
+	    [D,P,Q,U] = decode_mpi_parts(Data2, 4),
+	    #{ type => rsa, use => Use,creation => Creation,
+	       e=>E, n=>N, d=>D, p=>P, q=>Q, u=>U }
+    end.
+
+decrypt_secret_key(<<0,CheckSum:16,Data>>) ->
+    CheckSum = checksum(Data),
+    Data;
+decrypt_secret_key(<<254, Alg, Data/binary>>) ->
+    Data;
+decrypt_secret_key(<<255, Alg, Data/binary>>) ->
+    Data.    
+
+%% simple 16 bit sum over bytes 
+checksum(Data) ->
+    checksum(Data, 0).
+checksum(<<>>, Sum) -> Sum rem 16#ffff;
+checksum(<<C,Data/binary>>, Sum) ->
+    checksum(Data, Sum+C).
+
 encode_public_key(Key) ->
     case Key of
 	#{ type := elgamal, creation := Creation, p:=P, g:=G, y:=Y } ->
-	    encode_public_key_(?PUBLIC_KEY_ALGORITHM_ELGAMAL,
-			      Creation, [P,G,Y]);
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_ELGAMAL,
+			Creation, [P,G,Y]);
 	#{ type := dss, creation := Creation, p:=P, q :=Q, g:=G, y:=Y } ->
-	    encode_public_key_(?PUBLIC_KEY_ALGORITHM_DSA,
-			       Creation, [P,Q,G,Y]);
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_DSA,
+			Creation, [P,Q,G,Y]);
 	#{ type := rsa, creation := Creation,
 	   n:=N, e :=E } ->
-	    encode_public_key_(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN,
-			       Creation, [N,E])
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN,
+			Creation, [N,E])
     end.
 
-encode_public_key_(Algorithm,DateTime,Key) ->
+encode_secret_key(Key) ->
+    case Key of
+	#{ type := elgamal, creation := Creation,
+	   p:=P, g:=G, y := Y, x:=X } ->
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_ELGAMAL,
+		       Creation, [P,G,Y,X]);
+	#{ type := dss, creation := Creation, 
+	   p:=P, q :=Q, g:=G, y:=Y, x := X } ->
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_DSA,
+		       Creation, [P,Q,G,Y,X]);
+	#{ type := rsa, creation := Creation,
+	   n:=N, e :=E, d := D, p := P, q := Q, u :=U } ->
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN,
+		       Creation, [N,E,D,P,Q,U])
+    end.
+
+encode_key_(Algorithm,DateTime,Key) ->
     Timestamp = datetime_to_timestamp(DateTime),
     KeyData = [encode_mpi(X) || X <- Key],
     <<?KEY_VERSION_4,Timestamp:32,Algorithm,
@@ -1189,6 +1278,16 @@ decode_mpi_list(<<>>, 0) ->
 decode_mpi_list(<<L:16,Data:((L+7) div 8)/binary,Trailer/binary>>, I) ->
     X = binary:decode_unsigned(Data, big),
     [X | decode_mpi_list(Trailer,I-1)].
+
+decode_mpi_parts(Data, N) ->
+    decode_mpi_parts(Data, N, []).
+
+decode_mpi_parts(Rest, 0, Acc) ->
+    {lists:reverse(Acc), Rest};
+decode_mpi_parts(<<L:16,Data:((L+7) div 8)/binary,Rest/binary>>, I, Acc) ->
+    X = binary:decode_unsigned(Data, big),
+    decode_mpi_parts(Rest, I-1, [X|Acc]).
+
 
 decode_mpi_bin(<<L:16,Data:((L+7) div 8)/binary>>) ->
     Data.
