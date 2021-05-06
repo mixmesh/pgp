@@ -12,8 +12,6 @@
 -export([decode_signature_packet/1]).
 -export([key_id/1, encode_key/1]).
 
--export([decode_public_key/1, encode_public_key/1]).
-
 -include("OpenSSL.hrl").
 
 -define(err(F,A), io:format((F),(A))).
@@ -61,40 +59,6 @@
 -define(FEATURES, 30).
 -define(ISSUER_FINGERPRINT, 33).
 
-%% Section 9.5: Hash Algorithms
--define(HASH_ALGORITHM_MD5, 1).
--define(HASH_ALGORITHM_SHA1, 2).
--define(HASH_ALGORITHM_RIPEMD160, 3).
--define(HASH_ALGORITHM_SHA256, 8).
--define(HASH_ALGORITHM_SHA384, 9).
--define(HASH_ALGORITHM_SHA512, 10).
--define(HASH_ALGORITHM_SHA224, 11).
-
-%% Section 9.1: Public-Key Algorithms
--define(PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN, 1).  %% GEN/USE
--define(PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT, 2).  %% ACCEPT, NO GEN
--define(PUBLIC_KEY_ALGORITHM_RSA_SIGN, 3).     %% ACCEPT, NO GEN
--define(PUBLIC_KEY_ALGORITHM_ELGAMAL, 16).     %% ENCRYPT ONLY
--define(PUBLIC_KEY_ALGORITHM_DSA, 17).         %% SIGN ONLY
-
-%% 9.2.  Symmetric-Key Algorithms
--define(ENCRYPT_PLAINTEXT,  0).
--define(ENCRYPT_IDEA,       1).
--define(ENCRYPT_3DES,       2).   % (MUST)
--define(ENCRYPT_CAST5,      3).   % (SHOULD) (128 bit key, as per [RFC2144])
--define(ENCRYPT_BLOWFISH,   4).   % 128 bit key, 16 rounds
--define(ENCRYPT_AES_128,    7).   % (SHOULD) 128-bit key
--define(ENCRYPT_AES_192,    8).   % 192-bit key
--define(ENCRYPT_AES_256,    9).   % 256-bit key
--define(ENCRYPT_TWOFISH,   10).   % 256-bit key
-
-%% 9.3.  Compression Algorithms
--define(COMPRESS_UNCOMPRESSED, 0).
--define(COMPRESS_ZIP,          1).  % ZIP [RFC1951]
--define(COMPRESS_ZLIB,         2).  % ZLIB [RFC1950]
--define(COMPRESS_BZIP2,        3).  % BZip2 [BZ2]
-
--define(UNIX_SECONDS, (719528*24*60*60)).
 
 %% data tags
 -define(KEY_FIELD_TAG, 16#99).
@@ -330,7 +294,7 @@ encode_packets_([], Acc, Context) ->
 
 encode({public_key_encrypted,#{ algorithm := Alg,
 				keyid := KeyID, value := Data }},Context) ->
-    PubKeyAlgorithm = enc_pubkey_alg(Alg,[encrypt]),
+    PubKeyAlgorithm = pgp_keys:enc_pubkey_alg(Alg,[encrypt]),
     %% FIXME: encrypt
     encode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
 		  <<?KEY_VERSION_4, KeyID:8/binary,
@@ -343,7 +307,7 @@ encode({signature, #{ signature_type := SignatureType,
     #{ type :=  PublicKeyAlg } = PrivateKey,
     {HashedSubpackets,Context1} = encode_subpackets(Hashed, Context),
     HashedSubpacketsLength = byte_size(HashedSubpackets),
-    PublicKeyAlgorithm = enc_pubkey_alg(PublicKeyAlg,[sign]),
+    PublicKeyAlgorithm = pgp_keys:enc_pubkey_alg(PublicKeyAlg,[sign]),
     Hash = hash_signature_packet(
 	     SignatureType, PublicKeyAlgorithm, HashAlg,
 	     HashedSubpackets, Context),
@@ -357,18 +321,18 @@ encode({signature, #{ signature_type := SignatureType,
     Signature =
 	case PublicKeyAlg of
 	    rsa -> 
-		encode_mpi_bin(Signature0);
+		pgp_util:encode_mpi_bin(Signature0);
 	    dss ->
 		Sz = byte_size(Signature0) div 2,
 		<<R:Sz/binary, S:Sz/binary>> = Signature0,
-		MPI_R = encode_mpi_bin(R),
-		MPI_S = encode_mpi_bin(S),
+		MPI_R = pgp_util:encode_mpi_bin(R),
+		MPI_S = pgp_util:encode_mpi_bin(S),
 		<<MPI_R/binary, MPI_S/binary>>
 	end,
 
     {UnHashedSubpackets,Context2} = encode_subpackets(UnHashed, Context1),
     UnHashedSubpacketsLength = byte_size(UnHashedSubpackets),
-    HashAlgorithm = enc_crypto_hash(HashAlg),
+    HashAlgorithm = pgp_hash:encode(HashAlg),
     encode_packet(?SIGNATURE_PACKET,
 		  <<?SIG_VERSION_4,
 		    SignatureType,
@@ -390,19 +354,19 @@ encode({compressed,Packets}, Context) ->
     Algorithms = maps:get(preferred_compression_algorithms,Context,Default),
     compress_packet(Algorithms, Data ,Context);
 encode({key, #{ key := Key}}, Context) ->
-    KeyData = encode_public_key(Key),
+    KeyData = pgp_keys:encode_public_key(Key),
     encode_packet(?PUBLIC_KEY_PACKET, KeyData, 
 		  Context#{ key => Key, key_data => KeyData });
 encode({subkey, #{ subkey := Key }}, Context) ->
-    KeyData = encode_public_key(Key),
+    KeyData = pgp_keys:encode_public_key(Key),
     encode_packet(?PUBLIC_SUBKEY_PACKET, KeyData,
 		  Context#{ subkey => Key, subkey_data => KeyData });
 encode({secret_key, #{ key := Key}}, Context) ->
-    KeyData = encode_secret_key(Key),
+    KeyData = pgp_keys:encode_secret_key(Key, Context),
     encode_packet(?SECRET_KEY_PACKET, KeyData, 
 		  Context#{ key => Key, key_data => KeyData });
 encode({secrety_subkey, #{ subkey := Key }}, Context) ->
-    KeyData = encode_secret_key(Key),
+    KeyData = pgp_keys:encode_secret_key(Key, Context),
     encode_packet(?SECRET_SUBKEY_PACKET, KeyData,
 		  Context#{ subkey => Key, subkey_data => KeyData });
 encode({user_attribute, #{ value := UserAttribute }}, Context) ->
@@ -424,21 +388,9 @@ encode({encrypted_protected, #{ version := _Version,value := _Data}},
     %% FIXME: encrypt data using data from context and params
     encode_packet(?ENCRYPTED_PROTECTED_PACKET, <<>>, Context).
 
-compress_packet(Algorithms, Data, Context) ->
-    case Algorithms of
-	[uncompressed|_] ->
-	    encode_packet(?COMPRESSED_PACKET,
-			  <<?COMPRESS_UNCOMPRESSED,Data/binary>>, Context);
-	[zip|_] ->
-	    encode_packet(?COMPRESSED_PACKET,
-			  <<?COMPRESS_ZIP,(zlib:zip(Data))/binary>>, Context);
-	[zlib|_] ->
-	    encode_packet(?COMPRESSED_PACKET,
-			  <<?COMPRESS_ZIP,(zlib:compress(Data))/binary>>,
-			  Context);
-	[_|Rest] -> %% prefered not suppored try next
-	    compress_packet(Rest, Data, Context)
-    end.
+compress_packet(PreferedAlgorithms, Data, Context) ->
+    {Algorithm,Data1} = pgp_compress:compress(PreferedAlgorithms, Data),
+    encode_packet(?COMPRESSED_PACKET, <<Algorithm,Data1/binary>>, Context).
 
 %%
 %% Encode packet
@@ -568,7 +520,7 @@ decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
                 Algorithm,
 		Data/binary>>,
 	      Context) ->
-    {Alg,Use} = dec_pubkey_alg(Algorithm),
+    {Alg,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
     callback(public_key_encrypted, 
 	     #{ algorithm => Alg,
 		use => Use,  %% check encrypt?
@@ -588,8 +540,8 @@ decode_packet(?SIGNATURE_PACKET,
                 SignedHashLeft16:2/binary,
                 Signature/binary>> = SignatureData,
               Context) ->
-    HashAlg = dec_crypto_hash(HashAlgorithm),
-    {PublicKeyAlg,_Use} = dec_pubkey_alg(PublicKeyAlgorithm),
+    HashAlg = pgp_hash:decode(HashAlgorithm),
+    {PublicKeyAlg,_Use} = pgp_keys:dec_pubkey_alg(PublicKeyAlgorithm),
     Expected =
         case maps:get(skip_signature_check, Context) of
             true ->
@@ -675,17 +627,8 @@ decode_packet(?USER_ID_PACKET, UserId, Context) ->
 	     Context#{ user_id => UID,
 		       user_attribute => undefined });
 decode_packet(?COMPRESSED_PACKET, <<Algorithm,Data/binary>>, Context) ->
-    case dec_compression(Algorithm) of
-	uncompressed ->
-	    decode_packets(Data, Context);
-	zip ->
-	    decode_packets(zlib:unzip(Data), Context);
-	zlib ->
-	    decode_packets(zlib:uncompress(Data), Context);
-	bzip2 ->
-	    ?err("error bzip2: not_implemented\n", []),
-	    Context
-    end;
+    Data1 = pgp_compress:decompress(Algorithm,Data),
+    decode_packets(Data1, Context);
 decode_packet(?LITERAL_DATA_PACKET, <<Format,Data/binary>>, Context) ->
     %% convert format=$t line-endings?
     callback(literal_data, #{ format => Format, value => Data }, Context);
@@ -700,14 +643,14 @@ decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
 
 %% version 4
 decode_public_key_4(key, KeyData, Context) ->
-    Key = decode_public_key(KeyData),
+    Key = pgp_keys:decode_public_key(KeyData),
     KeyID = key_id(KeyData),
     callback(key, #{ key => Key,
 		     key_id => KeyID,
 		     key_data => KeyData }, 
 	     Context#{ key => Key, key_data => KeyData });
 decode_public_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
-    Key = decode_public_key(KeyData),
+    Key = pgp_keys:decode_public_key(KeyData),
     KeyID = key_id(KeyData),
     callback(subkey, #{ subkey => Key, 
 			subkey_id => KeyID,
@@ -715,33 +658,17 @@ decode_public_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
 			key => PrimaryKey },
 	     [user_id], Context#{ subkey => Key, subkey_data => KeyData }).
 
-decode_public_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
-    Creation = timestamp_to_datetime(Timestamp),
-    case dec_pubkey_alg(Algorithm) of
-	{elgamal,Use} ->
-	    [P, G, Y] = decode_mpi_list(Data, 3),
-	    #{ type => elgamal, use => Use, creation => Creation,
-	       p=>P, g=>G, y=>Y };
-	{dsa,Use} ->
-	    [P,Q,G,Y] = decode_mpi_list(Data, 4),
-	    #{ type => dss, use => Use, creation => Creation,
-	       p=>P, q=>Q, g=>G, y=>Y }; %% name is dss
-	{rsa,Use} ->
-	    [N,E] = decode_mpi_list(Data, 2),
-	    #{ type => rsa, use => Use,creation => Creation,
-	       e=>E, n=>N }
-    end.
 
 %% version 4
 decode_secret_key_4(secret_key, KeyData, Context) ->
-    Key = decode_secret_key(KeyData),
+    Key = pgp_keys:decode_secret_key(KeyData),
     KeyID = key_id(KeyData), %% fixme? public?
     callback(secret_key, #{ key => Key,
 			    key_id => KeyID,
 			    key_data => KeyData }, 
 	     Context#{ key => Key, key_data => KeyData });
 decode_secret_key_4(secret_subkey,KeyData,Context = #{ key := PrimaryKey }) ->
-    Key = decode_secret_key(KeyData),
+    Key = pgp_keys:decode_secret_key(KeyData),
     KeyID = key_id(KeyData), %% fixme? public?
     callback(secret_subkey, #{ subkey => Key, 
 			       subkey_id => KeyID,
@@ -749,80 +676,6 @@ decode_secret_key_4(secret_subkey,KeyData,Context = #{ key := PrimaryKey }) ->
 			       key => PrimaryKey },
 	     [user_id], Context#{ subkey => Key,
 				  subkey_data => KeyData }).
-
-decode_secret_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
-    Creation = timestamp_to_datetime(Timestamp),
-    case dec_pubkey_alg(Algorithm) of
-	{elgamal,Use} ->
-	    {[P, G, Y], Data1} = decode_mpi_parts(Data, 3),
-	    Data2 = decrypt_secret_key(Data1),
-	    {[X], <<>>} = decode_mpi_parts(Data2, 1),
-	    #{ type => elgamal, use => Use, creation => Creation,
-	       p=>P, g=>G, y=>Y, x=>X };
-	{dsa,Use} ->
-	    {[P,Q,G,Y], Data1} = decode_mpi_parts(Data, 4),
-	    Data2 = decrypt_secret_key(Data1),
-	    {[X], <<>>} = decode_mpi_parts(Data2, 1),
-	    #{ type => dss, use => Use, creation => Creation,
-	       p=>P, q=>Q, g=>G, y=>Y, x=>Y }; %% name is dss
-	{rsa,Use} ->
-	    {[N,E],Data1} = decode_mpi_parts(Data, 2),
-	    Data2 = decrypt_secret_key(Data1),
-	    [D,P,Q,U] = decode_mpi_parts(Data2, 4),
-	    #{ type => rsa, use => Use,creation => Creation,
-	       e=>E, n=>N, d=>D, p=>P, q=>Q, u=>U }
-    end.
-
-decrypt_secret_key(<<0,CheckSum:16,Data>>) ->
-    CheckSum = checksum(Data),
-    Data;
-decrypt_secret_key(<<254, Alg, Data/binary>>) ->
-    Data;
-decrypt_secret_key(<<255, Alg, Data/binary>>) ->
-    Data.    
-
-%% simple 16 bit sum over bytes 
-checksum(Data) ->
-    checksum(Data, 0).
-checksum(<<>>, Sum) -> Sum rem 16#ffff;
-checksum(<<C,Data/binary>>, Sum) ->
-    checksum(Data, Sum+C).
-
-encode_public_key(Key) ->
-    case Key of
-	#{ type := elgamal, creation := Creation, p:=P, g:=G, y:=Y } ->
-	    encode_key_(?PUBLIC_KEY_ALGORITHM_ELGAMAL,
-			Creation, [P,G,Y]);
-	#{ type := dss, creation := Creation, p:=P, q :=Q, g:=G, y:=Y } ->
-	    encode_key_(?PUBLIC_KEY_ALGORITHM_DSA,
-			Creation, [P,Q,G,Y]);
-	#{ type := rsa, creation := Creation,
-	   n:=N, e :=E } ->
-	    encode_key_(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN,
-			Creation, [N,E])
-    end.
-
-encode_secret_key(Key) ->
-    case Key of
-	#{ type := elgamal, creation := Creation,
-	   p:=P, g:=G, y := Y, x:=X } ->
-	    encode_key_(?PUBLIC_KEY_ALGORITHM_ELGAMAL,
-		       Creation, [P,G,Y,X]);
-	#{ type := dss, creation := Creation, 
-	   p:=P, q :=Q, g:=G, y:=Y, x := X } ->
-	    encode_key_(?PUBLIC_KEY_ALGORITHM_DSA,
-		       Creation, [P,Q,G,Y,X]);
-	#{ type := rsa, creation := Creation,
-	   n:=N, e :=E, d := D, p := P, q := Q, u :=U } ->
-	    encode_key_(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN,
-		       Creation, [N,E,D,P,Q,U])
-    end.
-
-encode_key_(Algorithm,DateTime,Key) ->
-    Timestamp = datetime_to_timestamp(DateTime),
-    KeyData = [encode_mpi(X) || X <- Key],
-    <<?KEY_VERSION_4,Timestamp:32,Algorithm,
-      (iolist_to_binary(KeyData))/binary>>.
 
 %%
 %% Signature packet handling
@@ -864,7 +717,7 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
                 ?err("unknown_signature_type: ~p\n",[SignatureType]),
                 HashState
         end,
-    HashAlgorithm = enc_crypto_hash(HashAlg),
+    HashAlgorithm = pgp_hash:encode(HashAlg),
     FinalData =
         <<?SIG_VERSION_4,
           SignatureType,
@@ -893,7 +746,8 @@ decode_subpackets(Packets, Context) ->
 %% 5.2.3.4.  Signature Creation Time
 decode_subpacket(<<?SIGNATURE_CREATION_TIME_SUBPACKET, Timestamp:32>>,
                         Context) ->
-    Param = decode_param(#{ value => timestamp_to_datetime(Timestamp) },
+    DateTime = pgp_util:timestamp_to_datetime(Timestamp),
+    Param = decode_param(#{ value => DateTime },
 			 Context),
     callback(signature_creation_time, Param,
 	     Context#{signature_creation_time => Timestamp});
@@ -904,29 +758,28 @@ decode_subpacket(<<?ISSUER_SUBPACKET, Issuer:8/binary>>, Context) ->
 
 %% 5.2.3.5.  Key Expiration TIme
 decode_subpacket(<<?KEY_EXPIRATION_SUBPACKET, Timestamp:32>>, Context) ->
-    Param = decode_param(#{ value => timestamp_to_datetime(Timestamp) },
-			 Context),
-    callback(key_expiration, Param,
-	     Context#{key_expiration => Timestamp});
+    DateTime = pgp_util:timestamp_to_datetime(Timestamp),
+    Param = decode_param(#{ value => DateTime }, Context),
+    callback(key_expiration, Param, Context#{key_expiration => Timestamp});
 
 %% 5.2.3.7.  Preferred Symmetric Algorithms
 decode_subpacket(<<?PREFERRED_SYMMETRIC_ALGORITHMS, Data/binary>>,
 			Context) ->
-    Value = [dec_crypto_cipher(V) || <<V>> <= Data ],
+    Value = [pgp_cipher:decode(V) || <<V>> <= Data ],
     Param = decode_param(#{ value => Value }, Context),
     callback(preferred_symmetric_algorithms, Param, Context);
 
 %% 5.2.3.8.  Preferred Hash Algorithms
 decode_subpacket(<<?PREFERRED_HASH_ALGORITHMS, Data/binary>>,
 			Context) ->
-    Value = [dec_crypto_hash(V) || <<V>> <= Data ],
+    Value = [pgp_hash:decode(V) || <<V>> <= Data ],
     Param = decode_param(#{ value => Value }, Context),
     callback(preferred_hash_algorithms, Param, Context);
 
 %% 5.2.3.9.  Preferred Compression Algorithms
 decode_subpacket(<<?PREFERRED_COMPRESSION_ALGORITHMS, Data/binary>>,
 		 Context) ->
-    Value = [dec_compression(V) || <<V>> <= Data ],
+    Value = [pgp_compress:decode(V) || <<V>> <= Data ],
     Param = decode_param(#{ value => Value },Context),
     callback(preferred_compression_algorithms, Param,Context);
 
@@ -990,7 +843,7 @@ encode_subpackets_([], Acc, Context) ->
 %% 5.2.3.4.  Signature Creation Time
 encode_subpacket({signature_creation_time,Param=#{ value := DateTime }},
 		 Context) ->
-    Timestamp = datetime_to_timestamp(DateTime),
+    Timestamp = pgp_util:datetime_to_timestamp(DateTime),
     encode_sub(?SIGNATURE_CREATION_TIME_SUBPACKET,<<Timestamp:32>>,
 	       Param, Context);
 %% 5.2.3.5.  Issuer
@@ -1008,31 +861,31 @@ encode_subpacket({issuer,Param=#{ value := Issuer }}, Context) ->
 
 %% 5.2.3.5.  Key Expiration TIme
 encode_subpacket({key_expiration,Param=#{ value := DateTime}},Context) ->
-    Timestamp = timestamp_to_datetime(DateTime),
+    Timestamp = pgp_util:timestamp_to_datetime(DateTime),
     encode_sub(?KEY_EXPIRATION_SUBPACKET,<<Timestamp:32>>,Param,Context);
 
 %% 5.2.3.7.  Preferred Symmetric Algorithms
 encode_subpacket({preferred_symmetric_algorithms,Param=#{ value := Value }},
 		 Context)->
-    Data = << <<(enc_crypto_cipher(V))>> || V <- Value >>,
+    Data = << <<(pgp_cipher:encode(V))>> || V <- Value >>,
     encode_sub(?PREFERRED_SYMMETRIC_ALGORITHMS,<<Data/binary>>,Param,Context);
 
 %% 5.2.3.8.  Preferred Hash Algorithms
 encode_subpacket({preferred_hash_algorithms,Param=#{ value := Value }},
 		 Context) ->
-    Data = << <<(enc_crypto_hash(V))>> || V <- Value >>,
+    Data = << <<(pgp_hash:encode(V))>> || V <- Value >>,
     encode_sub(?PREFERRED_HASH_ALGORITHMS,<<Data/binary>>,Param,Context);
 
 %% 5.2.3.9.  Preferred Compression Algorithms
 encode_subpacket({preferred_compression_algorithms,Param=#{ value := Value }},
 		 Context) ->
-    Data = << <<(enc_compression(V))>> || V <- Value >>,
+    Data = << <<(pgp_compress:encode(V))>> || V <- Value >>,
     encode_sub(?PREFERRED_COMPRESSION_ALGORITHMS,<<Data/binary>>,Param,Context);
 
 %% 5.2.3.10.  Key Expiration Time
 encode_subpacket({signature_expiration_time,Param=#{ value := DateTime}},
 		 Context) ->
-    Timestamp = timestamp_to_datetime(DateTime),
+    Timestamp = pgp_util:timestamp_to_datetime(DateTime),
     encode_sub(?SIGNATURE_EXPIRATION_TIME_SUBPACKET,<<Timestamp:32>>,Param,
 	       Context);
 
@@ -1117,7 +970,7 @@ verify_signature_packet(PublicKeyAlg, HashAlg, Hash, Signature,
 		16#18 ->
 		    #{ key := CryptoKey} = Context,
 		    #{ type := CryptoAlg } = CryptoKey,
-		    Key = public_params(CryptoKey),
+		    Key = pgp_keys:public_params(CryptoKey),
 		    crypto:verify(
 		      CryptoAlg, HashAlg, {digest, Hash},
 		      CryptoSignature, Key);
@@ -1129,7 +982,7 @@ verify_signature_packet(PublicKeyAlg, HashAlg, Hash, Signature,
 		    case prefix(KeyID, Issuer) of
 			true ->
 			    #{ type := CryptoAlg } = CryptoKey,
-			    Key = public_params(CryptoKey),
+			    Key = pgp_keys:public_params(CryptoKey),
 			    crypto:verify(
 			      CryptoAlg, HashAlg, {digest,Hash},
 			      CryptoSignature, Key);
@@ -1144,7 +997,7 @@ verify_signature_packet(PublicKeyAlg, HashAlg, Hash, Signature,
     end.
 
 sign_packet(PublicKeyAlg, HashAlg, Msg, PrivateKey) ->
-    KeyParams = private_params(PrivateKey),
+    KeyParams = pgp_keys:private_params(PrivateKey),
     crypto:sign(PublicKeyAlg, HashAlg, Msg, KeyParams).
 
 prefix(Binary, Prefix) ->
@@ -1158,92 +1011,13 @@ prefix(Binary, Prefix) ->
 
 %% extract signature data for verification
 crypto_signature(rsa,Signature) ->
-    {ok,decode_mpi_bin(Signature)};
+    {ok, pgp_util:decode_mpi_bin(Signature)};
 crypto_signature(dsa,Signature) ->
-    [R, S] = decode_mpi_list(Signature, 2),
+    [R, S] = pgp_util:decode_mpi_list(Signature, 2),
     'OpenSSL':encode('DssSignature', #'DssSignature'{r = R, s = S});
 crypto_signature(_PublicKeyAlgorithm,_Signature) ->
     ?err("unknown_crypto_signature ~p\n",[_PublicKeyAlgorithm]),
     {error,_PublicKeyAlgorithm}.
-
-
-dec_crypto_hash(?HASH_ALGORITHM_MD5) -> md5;
-dec_crypto_hash(?HASH_ALGORITHM_SHA1) -> sha;
-dec_crypto_hash(?HASH_ALGORITHM_RIPEMD160) -> ripemd160;
-dec_crypto_hash(?HASH_ALGORITHM_SHA256) -> sha256;
-dec_crypto_hash(?HASH_ALGORITHM_SHA384) -> sha384;
-dec_crypto_hash(?HASH_ALGORITHM_SHA512) -> sha512;
-dec_crypto_hash(?HASH_ALGORITHM_SHA224) -> sha224;
-dec_crypto_hash(X) -> {unknown,X}.
-
-enc_crypto_hash(md5) -> ?HASH_ALGORITHM_MD5;
-enc_crypto_hash(sha) -> ?HASH_ALGORITHM_SHA1;
-enc_crypto_hash(ripemd160) -> ?HASH_ALGORITHM_RIPEMD160;
-enc_crypto_hash(sha256) -> ?HASH_ALGORITHM_SHA256;
-enc_crypto_hash(sha384) -> ?HASH_ALGORITHM_SHA384;
-enc_crypto_hash(sha512) -> ?HASH_ALGORITHM_SHA512;
-enc_crypto_hash(sha224) -> ?HASH_ALGORITHM_SHA224.
-
-dec_crypto_cipher(?ENCRYPT_PLAINTEXT) -> plaintext;
-dec_crypto_cipher(?ENCRYPT_3DES) -> des_ede3_cbc;  %% check me
-% (SHOULD) (128 bit key, as per [RFC2144])
-dec_crypto_cipher(?ENCRYPT_CAST5) -> cast5; 
-% ? 128 bit key, 16 rounds
-dec_crypto_cipher(?ENCRYPT_BLOWFISH) -> blowfish_cfb64; 
-dec_crypto_cipher(?ENCRYPT_AES_128) -> aes_128_cbc;  % (SHOULD) 128-bit key
-dec_crypto_cipher(?ENCRYPT_AES_192) -> aes_192_cbc;
-dec_crypto_cipher(?ENCRYPT_AES_256) -> aes_256_cbc;
-dec_crypto_cipher(?ENCRYPT_TWOFISH) -> {unknown,twofish};
-dec_crypto_cipher(X) -> {unknown,X}.
-
-enc_crypto_cipher(plaintext) -> ?ENCRYPT_PLAINTEXT;
-enc_crypto_cipher(des_ede3_cbc) -> ?ENCRYPT_3DES;
-enc_crypto_cipher(cast5) -> ?ENCRYPT_CAST5;
-enc_crypto_cipher(blowfish_cfb64) -> ?ENCRYPT_BLOWFISH;
-enc_crypto_cipher(aes_128_cbc) -> ?ENCRYPT_AES_128;
-enc_crypto_cipher(aes_192_cbc) -> ?ENCRYPT_AES_192;
-enc_crypto_cipher(aes_256_cbc) -> ?ENCRYPT_AES_256.
-
-
-dec_compression(?COMPRESS_UNCOMPRESSED) -> uncompressed;
-dec_compression(?COMPRESS_ZIP) -> zip;
-dec_compression(?COMPRESS_ZLIB) -> zlib;
-dec_compression(?COMPRESS_BZIP2) -> bzip2;
-dec_compression(X) -> {unknown,X}.
-
-enc_compression(uncompressed) -> ?COMPRESS_UNCOMPRESSED;
-enc_compression(zip) -> ?COMPRESS_ZIP;
-enc_compression(zlib) -> ?COMPRESS_ZLIB;
-enc_compression(bzip2) ->?COMPRESS_BZIP2.
-
-
-dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN) -> 
-    {rsa,[encrypt,sign]};
-dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT) -> 
-    {rsa,[encrypt]};
-dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_SIGN) -> 
-    {rsa,[sign]};
-dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_DSA) -> 
-    {dsa,[sign]};
-dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_ELGAMAL) -> 
-    {elgamal,[encrypt,sign]}.
-
-enc_pubkey_alg(rsa,Use) ->
-    Encrypt = proplists:get_value(encrypt,Use,false),
-    Sign = proplists:get_value(sign,Use,false),
-    if Encrypt, Sign ->
-	    ?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN;
-       Encrypt ->
-	    ?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT;
-       Sign ->
-	    ?PUBLIC_KEY_ALGORITHM_RSA_SIGN
-    end;
-enc_pubkey_alg(dss,_Use) -> %% [sign]  %% when called with key
-    ?PUBLIC_KEY_ALGORITHM_DSA;
-enc_pubkey_alg(dsa,_Use) -> %% [sign]  %% when called with algorithm
-    ?PUBLIC_KEY_ALGORITHM_DSA;
-enc_pubkey_alg(elgamal,_Use) -> %% [encrypt,sign]
-    ?PUBLIC_KEY_ALGORITHM_ELGAMAL.
 
 %% get specified fields from map
 fields([F|Fs], Map) ->
@@ -1251,13 +1025,6 @@ fields([F|Fs], Map) ->
 fields([], _Map) ->
     [].
 
-public_params(#{ type := rsa, n := N, e := E }) -> [E, N];
-public_params(#{ type := dss, p := P, q := Q, g := G, y:=Y }) -> [P,Q,G,Y];
-public_params(#{ type := elgamal, p := P, g := G, y := Y }) -> [P,G,Y].
-
-private_params(#{ type := rsa, n := N, d := D, e := E }) -> [E, N, D];
-private_params(#{ type := dss, p := P, q := Q, g := G, x:=X }) -> [P,Q,G,X];
-private_params(#{ type := elgamal, p := P, g := G, x := X }) -> [P,G,X].
 
 signature_type_to_signature_level(SignatureType)
   when SignatureType >= 16#11 andalso SignatureType =< 16#13 ->
@@ -1270,55 +1037,6 @@ signature_level_to_signature_type("2") -> 16#12;
 signature_level_to_signature_type("3") -> 16#13;
 signature_level_to_signature_type(_) -> 0.  %%?
 
-decode_mpi(<<L:16,Data:((L+7) div 8)/binary>>) ->
-    binary:decode_unsigned(Data, big).
-
-decode_mpi_list(<<>>, 0) ->
-    [];
-decode_mpi_list(<<L:16,Data:((L+7) div 8)/binary,Trailer/binary>>, I) ->
-    X = binary:decode_unsigned(Data, big),
-    [X | decode_mpi_list(Trailer,I-1)].
-
-decode_mpi_parts(Data, N) ->
-    decode_mpi_parts(Data, N, []).
-
-decode_mpi_parts(Rest, 0, Acc) ->
-    {lists:reverse(Acc), Rest};
-decode_mpi_parts(<<L:16,Data:((L+7) div 8)/binary,Rest/binary>>, I, Acc) ->
-    X = binary:decode_unsigned(Data, big),
-    decode_mpi_parts(Rest, I-1, [X|Acc]).
-
-
-decode_mpi_bin(<<L:16,Data:((L+7) div 8)/binary>>) ->
-    Data.
-
-decode_mpi_bin(_, 0) ->
-    [];
-decode_mpi_bin(<<L:16,Data:((L+7) div 8)/binary,Rest/binary>>, I) ->
-    [Data | decode_mpi_bin(Rest, I-1)].
-
-encode_mpi_bin(Bin) when is_binary(Bin) ->
-    L = byte_size(Bin),
-    <<(L*8):16, Bin/binary>>.
-
-%% is bit size needed? now I assume bytes*8 is ok.
-encode_mpi(X) when is_integer(X) ->
-    Data = binary:encode_unsigned(X, big),
-    L = byte_size(Data),
-    <<(L*8):16, Data/binary>>.
-
-%% UTC datetime
-timestamp_to_datetime(Timestamp) ->
-    UnixTimestamp = Timestamp + ?UNIX_SECONDS,
-    calendar:gregorian_seconds_to_datetime(UnixTimestamp).
-
-%% Local datetime
-timestamp_to_local_datetime(Timestamp) ->
-    UTCDateTime = timestamp_to_datetime(Timestamp),
-    calendar:universal_time_to_local_time(UTCDateTime).
-
-datetime_to_timestamp(UTCDateTime) ->
-    calendar:datetime_to_gregorian_seconds(UTCDateTime) - ?UNIX_SECONDS.
 
 %%
 %% test various packets encodings

@@ -7,12 +7,30 @@
 
 -module(pgp_keys).
 
+-export([encode_public_key/1]).
+-export([encode_secret_key/1, encode_secret_key/2]).
+-export([decode_public_key/1]).
+-export([decode_secret_key/1, decode_secret_key/2]).
+
 -export([generate_rsa_key/0, generate_rsa_key/2]).
 -export([generate_dss_key/0, generate_dss_key/1]).
 -export([generate_elgamal_key/0, generate_elgamal_key/1]).
 -export([generate_mixmesh_key/0, generate_mixmesh_key/1]).
+-export([enc_pubkey_alg/2, dec_pubkey_alg/1]).
+-export([public_params/1, private_params/1]).
 
--include_lib("elgamal/include/elgamal.hrl").
+%% -compile(export_all).
+%% -define(dbg(F,A), io:format((F),(A))).
+-define(dbg(F,A), ok).
+
+-define(KEY_VERSION_4, 4).
+
+%% Section 9.1: Public-Key Algorithms
+-define(PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN, 1).  %% GEN/USE
+-define(PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT, 2).  %% ACCEPT, NO GEN
+-define(PUBLIC_KEY_ALGORITHM_RSA_SIGN, 3).     %% ACCEPT, NO GEN
+-define(PUBLIC_KEY_ALGORITHM_ELGAMAL, 16).     %% ENCRYPT ONLY
+-define(PUBLIC_KEY_ALGORITHM_DSA, 17).         %% SIGN ONLY
 
 -type public_rsa() :: map().
 -type private_rsa() :: map().
@@ -44,20 +62,19 @@ generate_rsa_key(ModulusSizeInBits, PublicExponent) ->
 		       u => binary:decode_unsigned(C, big) },
     {Public, Private}.
 
+-include("pgp_mixmesh_1.hrl").
+-include("pgp_mixmesh_2.hrl").
+
 generate_mixmesh_key() ->
     generate_mixmesh_key(1024).
 
-generate_mixmesh_key(old) ->
-    G = ?G_OLD,
-    P = ?P_OLD,
-    generate_mixmesh_key(P,G);
 generate_mixmesh_key(512) ->
-    G = ?G_512,
-    P = ?P_512,
+    G = ?MIXMESH_G_1,
+    P = ?MIXMESH_KEY_1,
     generate_mixmesh_key(P,G);
 generate_mixmesh_key(1024) ->
-    G = ?G_1024,
-    P = ?P_1024,
+    G = ?MIXMESH_G_2,
+    P = ?MIXMESH_KEY_2,
     generate_mixmesh_key(P,G).
 
 generate_mixmesh_key(P,G) ->
@@ -104,6 +121,231 @@ generate_dh_key__(Type, Use, P, Q, G) ->
     Private = Public#{ x => X },
     {Public, Private }.
 
+encode_public_key(Key) ->
+    case Key of
+	#{ type := elgamal, creation := Creation, p:=P, g:=G, y:=Y } ->
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_ELGAMAL,
+			Creation, [P,G,Y]);
+	#{ type := dss, creation := Creation, p:=P, q :=Q, g:=G, y:=Y } ->
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_DSA,
+			Creation, [P,Q,G,Y]);
+	#{ type := rsa, creation := Creation,
+	   n:=N, e :=E } ->
+	    encode_key_(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN,
+			Creation, [N,E])
+    end.
+
+encode_secret_key(Key) ->
+    encode_secret_key(Key, #{}).
+
+encode_secret_key(Key, Context) ->
+    case Key of
+	#{ type := elgamal, x:=X } ->
+	    Data1 = encode_public_key(Key), 
+	    Data2 = encrypt_key_data([X], Context),
+	    <<Data1/binary, Data2/binary>>;
+	    
+	#{ type := dss, x := X } ->
+	    Data1 = encode_public_key(Key), 
+	    Data2 = encrypt_key_data([X], Context),
+	    ?dbg("Data2[~w] = ~p\n", [byte_size(Data2), Data2]),
+	    <<Data1/binary, Data2/binary>>;
+
+	#{ type := rsa, d := D, p := P, q := Q, u :=U } ->
+	    Data1 = encode_public_key(Key), 
+	    Data2 = encrypt_key_data([D,P,Q,U], Context),
+	    <<Data1/binary, Data2/binary>>
+    end.
+
+encrypt_key_data(List, Context) ->
+    Data = pgp_util:encode_mpi_list(List),
+    ?dbg("Data[~w] = ~p\n", [byte_size(Data), Data]),
+    case maps:get(password, Context, undefined) of
+	undefined -> %% no password
+	    CheckSum = checksum(Data),
+	    <<0,CheckSum:16,Data/binary>>;
+	Password ->
+	    Cipher = maps:get(cipher, Context, des_ede3_cbc),
+	    Checksum = maps:get(checksum, Context, hash),
+	    CipherAlgorithm = pgp_cipher:encode(Cipher),
+	    S2K = pgp_cipher:adjust_s2k(maps:get(s2k, Context, {simple, md5})),
+	    {S2KUse,S2KSpec,Data1} =
+		case Checksum of
+		    none ->
+			{CipherAlgorithm,<<>>,Data};
+		    checksum ->
+			CheckSum = checksum(Data),
+			S2KBin = pgp_cipher:encode_s2k(S2K),
+			{255,<<CipherAlgorithm,S2KBin/binary>>,
+			 <<CheckSum:16, Data/binary>>};
+		    hash ->
+			Hash = crypto:hash(sha, Data),
+			S2KBin = pgp_cipher:encode_s2k(S2K),
+			{254,<<CipherAlgorithm,S2KBin/binary>>,
+			 <<Hash:20/binary, Data/binary>>}
+		end,
+	    ?dbg("S2KUse=~w, S2KSpec=~w,\n", [S2KUse, S2KSpec]),
+	    ?dbg("Data1[~w]=~p,\n", [byte_size(Data1), Data1]),
+	    case pgp_cipher:encrypt(Cipher,S2K,Data1,Password) of
+		Data2 when is_binary(Data2) ->
+		    ?dbg("Data2[~w]=~p,\n", [byte_size(Data2), Data2]),
+		    <<S2KUse,S2KSpec/binary,Data2/binary>>;
+		Error ->
+		    Error
+	    end
+    end.
+
+encode_key_(Algorithm,DateTime,Key) ->
+    Timestamp = pgp_util:datetime_to_timestamp(DateTime),
+    KeyData = [pgp_util:encode_mpi(X) || X <- Key],
+    <<?KEY_VERSION_4,Timestamp:32,Algorithm,
+      (iolist_to_binary(KeyData))/binary>>.
+
+decode_public_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
+    Creation = pgp_util:timestamp_to_datetime(Timestamp),
+    case dec_pubkey_alg(Algorithm) of
+	{elgamal,Use} ->
+	    [P, G, Y] = pgp_util:decode_mpi_list(Data, 3),
+	    #{ type => elgamal, use => Use, creation => Creation,
+	       p=>P, g=>G, y=>Y };
+	{dsa,Use} ->
+	    [P,Q,G,Y] = pgp_util:decode_mpi_list(Data, 4),
+	    #{ type => dss, use => Use, creation => Creation,
+	       p=>P, q=>Q, g=>G, y=>Y }; %% name is dss
+	{rsa,Use} ->
+	    [N,E] = pgp_util:decode_mpi_list(Data, 2),
+	    #{ type => rsa, use => Use,creation => Creation,
+	       e=>E, n=>N }
+    end.
+
+decode_secret_key(Data) ->
+    decode_secret_key(Data, #{}).
+
+decode_secret_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>,
+		  Context) ->
+    Creation = pgp_util:timestamp_to_datetime(Timestamp),
+    case dec_pubkey_alg(Algorithm) of
+	{elgamal,Use} ->
+	    {[P, G, Y], Data1} = pgp_util:decode_mpi_parts(Data, 3),
+	    Data2 = decrypt_key_data(Data1, 1, Context),
+	    {[X], <<>>} = pgp_util:decode_mpi_parts(Data2, 1),
+	    #{ type => elgamal, use => Use, creation => Creation,
+	       p=>P, g=>G, y=>Y, x=>X };
+	{dsa,Use} ->
+	    {[P,Q,G,Y], Data1} = pgp_util:decode_mpi_parts(Data, 4),
+	    Data2 = decrypt_key_data(Data1, 1, Context),
+	    ?dbg("Data2[~w] = ~p\n", [byte_size(Data2), Data2]),
+	    {[X], <<>>} = pgp_util:decode_mpi_parts(Data2, 1),
+	    #{ type => dss, use => Use, creation => Creation,
+	       p=>P, q=>Q, g=>G, y=>Y, x=>X }; %% name is dss
+	{rsa,Use} ->
+	    {[N,E],Data1} = pgp_util:decode_mpi_parts(Data, 2),
+	    Data2 = decrypt_key_data(Data1, 4, Context),
+	    {[D,P,Q,U],<<>>} = pgp_util:decode_mpi_parts(Data2, 4),
+	    #{ type => rsa, use => Use,creation => Creation,
+	       e=>E, n=>N, d=>D, p=>P, q=>Q, u=>U }
+    end.
+
+decrypt_key_data(<<0,CheckSum:16,Data/binary>>, _N, _Context) ->
+    ?dbg("decrypt_key_data: checksum, cipher=plaintext\n", []),
+    CheckSum = checksum(Data),
+    Data;
+decrypt_key_data(<<254, CipherAlgorim, Data/binary>>, N, Context) ->
+    {S2K, Data1} = pgp_cipher:decode_s2k(Data),
+    Cipher = pgp_cipher:decode(CipherAlgorim),
+    ?dbg("decrypt_key_data: hash s2k=~w, cipher=~w\n", [S2K,Cipher]),
+    Password = maps:get(password, Context),
+    case pgp_cipher:decrypt(Cipher,S2K,Data1,Password) of
+	<<Hash:20/binary, Data2/binary>> ->
+	    Len = mpi_len(Data2, N),
+	    <<Data3:Len/binary, _ZData/binary>> = Data2,
+	    ?dbg("Data3[~w] = ~p\n", [byte_size(Data3), Data3]),
+	    case crypto:hash(sha, Data3) of
+		Hash -> Data3;
+		_ ->
+		    {error,bad_hash}
+	    end;
+	Error ->
+	    Error
+    end;
+decrypt_key_data(<<255, CipherAlgorithm, Data/binary>>, N, Context) ->
+    {S2K, Data1} = pgp_cipher:decode_s2k(Data),
+    Cipher = pgp_cipher:decode(CipherAlgorithm),
+    ?dbg("decrypt_key_data: checksum s2k=~w, cipher=~w\n", [S2K,Cipher]),
+    Password = maps:get(password, Context),
+    case pgp_cipher:decrypt(Cipher,S2K,Data1,Password) of
+	<<CheckSum:16,Data2/binary>> ->
+	    Len = mpi_len(Data2, N),
+	    <<Data3:Len/binary, _ZData/binary>> = Data2,
+	    case checksum(Data3) of
+		CheckSum -> Data3;
+		_ -> {error,bad_checksum}
+	    end;
+	Error ->
+	    Error
+    end;
+decrypt_key_data(<<CipherAlgorithm, Data/binary>>, N, Context) ->
+    Cipher = pgp_cipher:decode(CipherAlgorithm),
+    ?dbg("decrypt_key_data: s2k=~w, cipher=~w\n", [{simple,md5},Cipher]),
+    Password = maps:get(password, Context),
+    Data2 = pgp_cipher:decrypt(Cipher,{simple,md5},Data,Password),
+    Len = mpi_len(Data2, N),
+    <<Data3:Len/binary, _ZData/binary>> = Data2,
+    Data3.
+
+%% given number of expected mpi data,
+%% calculate byte length for mpi data + length bytes
+mpi_len(Data, N) ->
+    mpi_len(Data, N, 0).
+mpi_len(_, 0, Bytes) ->
+    Bytes;
+mpi_len(<<L:16,_:((L+7) div 8)/binary, Rest/binary>>, I, Bytes) ->
+    mpi_len(Rest, I-1, Bytes + 2 + ((L+7) div 8)).
+
+%% simple 16 bit sum over bytes 
+checksum(Data) ->
+    checksum(Data, 0).
+checksum(<<>>, Sum) -> Sum rem 16#ffff;
+checksum(<<C,Data/binary>>, Sum) ->
+    checksum(Data, Sum+C).
+
+dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN) -> 
+    {rsa,[encrypt,sign]};
+dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT) -> 
+    {rsa,[encrypt]};
+dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_SIGN) -> 
+    {rsa,[sign]};
+dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_DSA) -> 
+    {dsa,[sign]};
+dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_ELGAMAL) -> 
+    {elgamal,[encrypt,sign]}.
+
+enc_pubkey_alg(rsa,Use) ->
+    Encrypt = proplists:get_value(encrypt,Use,false),
+    Sign = proplists:get_value(sign,Use,false),
+    if Encrypt, Sign ->
+	    ?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN;
+       Encrypt ->
+	    ?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT;
+       Sign ->
+	    ?PUBLIC_KEY_ALGORITHM_RSA_SIGN
+    end;
+enc_pubkey_alg(dss,_Use) -> %% [sign]  %% when called with key
+    ?PUBLIC_KEY_ALGORITHM_DSA;
+enc_pubkey_alg(dsa,_Use) -> %% [sign]  %% when called with algorithm
+    ?PUBLIC_KEY_ALGORITHM_DSA;
+enc_pubkey_alg(elgamal,_Use) -> %% [encrypt,sign]
+    ?PUBLIC_KEY_ALGORITHM_ELGAMAL.
+
+public_params(#{ type := rsa, n := N, e := E }) -> [E, N];
+public_params(#{ type := dss, p := P, q := Q, g := G, y:=Y }) -> [P,Q,G,Y];
+public_params(#{ type := elgamal, p := P, g := G, y := Y }) -> [P,G,Y].
+
+private_params(#{ type := rsa, n := N, d := D, e := E }) -> [E, N, D];
+private_params(#{ type := dss, p := P, q := Q, g := G, x:=X }) -> [P,Q,G,X];
+private_params(#{ type := elgamal, p := P, g := G, x := X }) -> [P,G,X].
+
+
 dh_size_to_group(768) -> 1;
 dh_size_to_group(1536) -> 5;
 dh_size_to_group(2048) -> 14;
@@ -115,26 +357,26 @@ dh_size_to_group(8192) -> 18.
 dh_group_to_g(_) -> 2.
 
 %% FIXME: add keys from https://tools.ietf.org/html/rfc7919?
+-include("pgp_dh_1.hrl").
+-include("pgp_dh_5.hrl").
+-include("pgp_dh_14.hrl").
+-include("pgp_dh_15.hrl").
+-include("pgp_dh_16.hrl").
+-include("pgp_dh_17.hrl").
+-include("pgp_dh_18.hrl").
 
 %% ID = 1, G=2, SIZE=768
-dh_group_to_p(1) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A63A3620_FFFFFFFF_FFFFFFFF;
-
+dh_group_to_p(1) -> ?DH_KEY_1;
 %% ID = 5, G=2, SIZE=1536
-dh_group_to_p(5) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A637ED6B_0BFF5CB6_F406B7ED_EE386BFB_5A899FA5_AE9F2411_7C4B1FE6_49286651_ECE45B3D_C2007CB8_A163BF05_98DA4836_1C55D39A_69163FA8_FD24CF5F_83655D23_DCA3AD96_1C62F356_208552BB_9ED52907_7096966D_670C354E_4ABC9804_F1746C08_CA237327_FFFFFFFF_FFFFFFFF;
+dh_group_to_p(5) -> ?DH_KEY_5;
 %% ID = 14, G=2, SIZE=2048
-dh_group_to_p(14) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A637ED6B_0BFF5CB6_F406B7ED_EE386BFB_5A899FA5_AE9F2411_7C4B1FE6_49286651_ECE45B3D_C2007CB8_A163BF05_98DA4836_1C55D39A_69163FA8_FD24CF5F_83655D23_DCA3AD96_1C62F356_208552BB_9ED52907_7096966D_670C354E_4ABC9804_F1746C08_CA18217C_32905E46_2E36CE3B_E39E772C_180E8603_9B2783A2_EC07A28F_B5C55DF0_6F4C52C9_DE2BCBF6_95581718_3995497C_EA956AE5_15D22618_98FA0510_15728E5A_8AACAA68_FFFFFFFF_FFFFFFFF;
+dh_group_to_p(14) -> ?DH_KEY_14;
 %% ID = 15, G=2, SIZE=3072
-dh_group_to_p(15) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A637ED6B_0BFF5CB6_F406B7ED_EE386BFB_5A899FA5_AE9F2411_7C4B1FE6_49286651_ECE45B3D_C2007CB8_A163BF05_98DA4836_1C55D39A_69163FA8_FD24CF5F_83655D23_DCA3AD96_1C62F356_208552BB_9ED52907_7096966D_670C354E_4ABC9804_F1746C08_CA18217C_32905E46_2E36CE3B_E39E772C_180E8603_9B2783A2_EC07A28F_B5C55DF0_6F4C52C9_DE2BCBF6_95581718_3995497C_EA956AE5_15D22618_98FA0510_15728E5A_8AAAC42D_AD33170D_04507A33_A85521AB_DF1CBA64_ECFB8504_58DBEF0A_8AEA7157_5D060C7D_B3970F85_A6E1E4C7_ABF5AE8C_DB0933D7_1E8C94E0_4A25619D_CEE3D226_1AD2EE6B_F12FFA06_D98A0864_D8760273_3EC86A64_521F2B18_177B200C_BBE11757_7A615D6C_770988C0_BAD946E2_08E24FA0_74E5AB31_43DB5BFC_E0FD108E_4B82D120_A93AD2CA_FFFFFFFF_FFFFFFFF;
+dh_group_to_p(15) -> ?DH_KEY_15;
 %% ID = 16, G=2, SIZE=4096
-dh_group_to_p(16) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A637ED6B_0BFF5CB6_F406B7ED_EE386BFB_5A899FA5_AE9F2411_7C4B1FE6_49286651_ECE45B3D_C2007CB8_A163BF05_98DA4836_1C55D39A_69163FA8_FD24CF5F_83655D23_DCA3AD96_1C62F356_208552BB_9ED52907_7096966D_670C354E_4ABC9804_F1746C08_CA18217C_32905E46_2E36CE3B_E39E772C_180E8603_9B2783A2_EC07A28F_B5C55DF0_6F4C52C9_DE2BCBF6_95581718_3995497C_EA956AE5_15D22618_98FA0510_15728E5A_8AAAC42D_AD33170D_04507A33_A85521AB_DF1CBA64_ECFB8504_58DBEF0A_8AEA7157_5D060C7D_B3970F85_A6E1E4C7_ABF5AE8C_DB0933D7_1E8C94E0_4A25619D_CEE3D226_1AD2EE6B_F12FFA06_D98A0864_D8760273_3EC86A64_521F2B18_177B200C_BBE11757_7A615D6C_770988C0_BAD946E2_08E24FA0_74E5AB31_43DB5BFC_E0FD108E_4B82D120_A9210801_1A723C12_A787E6D7_88719A10_BDBA5B26_99C32718_6AF4E23C_1A946834_B6150BDA_2583E9CA_2AD44CE8_DBBBC2DB_04DE8EF9_2E8EFC14_1FBECAA6_287C5947_4E6BC05D_99B2964F_A090C3A2_233BA186_515BE7ED_1F612970_CEE2D7AF_B81BDD76_2170481C_D0069127_D5B05AA9_93B4EA98_8D8FDDC1_86FFB7DC_90A6C08F_4DF435C9_34063199_FFFFFFFF_FFFFFFFF;
+dh_group_to_p(16) -> ?DH_KEY_16;
 %% ID = 17, G=2, SIZE=6144
-dh_group_to_p(17) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A637ED6B_0BFF5CB6_F406B7ED_EE386BFB_5A899FA5_AE9F2411_7C4B1FE6_49286651_ECE45B3D_C2007CB8_A163BF05_98DA4836_1C55D39A_69163FA8_FD24CF5F_83655D23_DCA3AD96_1C62F356_208552BB_9ED52907_7096966D_670C354E_4ABC9804_F1746C08_CA18217C_32905E46_2E36CE3B_E39E772C_180E8603_9B2783A2_EC07A28F_B5C55DF0_6F4C52C9_DE2BCBF6_95581718_3995497C_EA956AE5_15D22618_98FA0510_15728E5A_8AAAC42D_AD33170D_04507A33_A85521AB_DF1CBA64_ECFB8504_58DBEF0A_8AEA7157_5D060C7D_B3970F85_A6E1E4C7_ABF5AE8C_DB0933D7_1E8C94E0_4A25619D_CEE3D226_1AD2EE6B_F12FFA06_D98A0864_D8760273_3EC86A64_521F2B18_177B200C_BBE11757_7A615D6C_770988C0_BAD946E2_08E24FA0_74E5AB31_43DB5BFC_E0FD108E_4B82D120_A9210801_1A723C12_A787E6D7_88719A10_BDBA5B26_99C32718_6AF4E23C_1A946834_B6150BDA_2583E9CA_2AD44CE8_DBBBC2DB_04DE8EF9_2E8EFC14_1FBECAA6_287C5947_4E6BC05D_99B2964F_A090C3A2_233BA186_515BE7ED_1F612970_CEE2D7AF_B81BDD76_2170481C_D0069127_D5B05AA9_93B4EA98_8D8FDDC1_86FFB7DC_90A6C08F_4DF435C9_34028492_36C3FAB4_D27C7026_C1D4DCB2_602646DE_C9751E76_3DBA37BD_F8FF9406_AD9E530E_E5DB382F_413001AE_B06A53ED_9027D831_179727B0_865A8918_DA3EDBEB_CF9B14ED_44CE6CBA_CED4BB1B_DB7F1447_E6CC254B_33205151_2BD7AF42_6FB8F401_378CD2BF_5983CA01_C64B92EC_F032EA15_D1721D03_F482D7CE_6E74FEF6_D55E702F_46980C82_B5A84031_900B1C9E_59E7C97F_BEC7E8F3_23A97A7E_36CC88BE_0F1D45B7_FF585AC5_4BD407B2_2B4154AA_CC8F6D7E_BF48E1D8_14CC5ED2_0F8037E0_A79715EE_F29BE328_06A1D58B_B7C5DA76_F550AA3D_8A1FBFF0_EB19CCB1_A313D55C_DA56C9EC_2EF29632_387FE8D7_6E3C0468_043E8F66_3F4860EE_12BF2D5B_0B7474D6_E694F91E_6DCC4024_FFFFFFFF_FFFFFFFF;
+dh_group_to_p(17) -> ?DH_KEY_17;
 %% ID = 18, G=2, SIZE=8192
-dh_group_to_p(18) ->
-    16#FFFFFFFF_FFFFFFFF_C90FDAA2_2168C234_C4C6628B_80DC1CD1_29024E08_8A67CC74_020BBEA6_3B139B22_514A0879_8E3404DD_EF9519B3_CD3A431B_302B0A6D_F25F1437_4FE1356D_6D51C245_E485B576_625E7EC6_F44C42E9_A637ED6B_0BFF5CB6_F406B7ED_EE386BFB_5A899FA5_AE9F2411_7C4B1FE6_49286651_ECE45B3D_C2007CB8_A163BF05_98DA4836_1C55D39A_69163FA8_FD24CF5F_83655D23_DCA3AD96_1C62F356_208552BB_9ED52907_7096966D_670C354E_4ABC9804_F1746C08_CA18217C_32905E46_2E36CE3B_E39E772C_180E8603_9B2783A2_EC07A28F_B5C55DF0_6F4C52C9_DE2BCBF6_95581718_3995497C_EA956AE5_15D22618_98FA0510_15728E5A_8AAAC42D_AD33170D_04507A33_A85521AB_DF1CBA64_ECFB8504_58DBEF0A_8AEA7157_5D060C7D_B3970F85_A6E1E4C7_ABF5AE8C_DB0933D7_1E8C94E0_4A25619D_CEE3D226_1AD2EE6B_F12FFA06_D98A0864_D8760273_3EC86A64_521F2B18_177B200C_BBE11757_7A615D6C_770988C0_BAD946E2_08E24FA0_74E5AB31_43DB5BFC_E0FD108E_4B82D120_A9210801_1A723C12_A787E6D7_88719A10_BDBA5B26_99C32718_6AF4E23C_1A946834_B6150BDA_2583E9CA_2AD44CE8_DBBBC2DB_04DE8EF9_2E8EFC14_1FBECAA6_287C5947_4E6BC05D_99B2964F_A090C3A2_233BA186_515BE7ED_1F612970_CEE2D7AF_B81BDD76_2170481C_D0069127_D5B05AA9_93B4EA98_8D8FDDC1_86FFB7DC_90A6C08F_4DF435C9_34028492_36C3FAB4_D27C7026_C1D4DCB2_602646DE_C9751E76_3DBA37BD_F8FF9406_AD9E530E_E5DB382F_413001AE_B06A53ED_9027D831_179727B0_865A8918_DA3EDBEB_CF9B14ED_44CE6CBA_CED4BB1B_DB7F1447_E6CC254B_33205151_2BD7AF42_6FB8F401_378CD2BF_5983CA01_C64B92EC_F032EA15_D1721D03_F482D7CE_6E74FEF6_D55E702F_46980C82_B5A84031_900B1C9E_59E7C97F_BEC7E8F3_23A97A7E_36CC88BE_0F1D45B7_FF585AC5_4BD407B2_2B4154AA_CC8F6D7E_BF48E1D8_14CC5ED2_0F8037E0_A79715EE_F29BE328_06A1D58B_B7C5DA76_F550AA3D_8A1FBFF0_EB19CCB1_A313D55C_DA56C9EC_2EF29632_387FE8D7_6E3C0468_043E8F66_3F4860EE_12BF2D5B_0B7474D6_E694F91E_6DBE1159_74A3926F_12FEE5E4_38777CB6_A932DF8C_D8BEC4D0_73B931BA_3BC832B6_8D9DD300_741FA7BF_8AFC47ED_2576F693_6BA42466_3AAB639C_5AE4F568_3423B474_2BF1C978_238F16CB_E39D652D_E3FDB8BE_FC848AD9_22222E04_A4037C07_13EB57A8_1A23F0C7_3473FC64_6CEA306B_4BCBC886_2F8385DD_FA9D4B7F_A2C087E8_79683303_ED5BDD3A_062B3CF5_B3A278A6_6D2A13F8_3F44F82D_DF310EE0_74AB6A36_4597E899_A0255DC1_64F31CC5_0846851D_F9AB4819_5DED7EA1_B1D510BD_7EE74D73_FAF36BC3_1ECFA268_359046F4_EB879F92_4009438B_481C6CD7_889A002E_D5EE382B_C9190DA6_FC026E47_9558E447_5677E9AA_9E3050E2_765694DF_C81F56E8_80B96E71_60C980DD_98EDD3DF_FFFFFFFF_FFFFFFFF.
+dh_group_to_p(18) -> ?DH_KEY_18.
+
