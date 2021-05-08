@@ -10,7 +10,7 @@
 
 -export([decode_stream/2, decode_stream/1]).
 -export([decode_signature_packet/1]).
--export([key_id/1, encode_key/1]).
+-export([fingerprint/1, key_id/1, encode_key/1]).
 
 -include("OpenSSL.hrl").
 
