@@ -162,7 +162,7 @@ encrypt_key_data(List, Context) ->
     ?dbg("Data[~w] = ~p\n", [byte_size(Data), Data]),
     case maps:get(password, Context, undefined) of
 	undefined -> %% no password
-	    CheckSum = checksum(Data),
+	    CheckSum = pgp_util:checksum(Data),
 	    <<0,CheckSum:16,Data/binary>>;
 	Password ->
 	    Cipher = maps:get(cipher, Context, des_ede3_cbc),
@@ -174,7 +174,7 @@ encrypt_key_data(List, Context) ->
 		    none ->
 			{CipherAlgorithm,<<>>,Data};
 		    checksum ->
-			CheckSum = checksum(Data),
+			CheckSum = pgp_util:checksum(Data),
 			S2KBin = pgp_cipher:encode_s2k(S2K),
 			{255,<<CipherAlgorithm,S2KBin/binary>>,
 			 <<CheckSum:16, Data/binary>>};
@@ -248,7 +248,7 @@ decode_secret_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>,
 
 decrypt_key_data(<<0,CheckSum:16,Data/binary>>, _N, _Context) ->
     ?dbg("decrypt_key_data: checksum, cipher=plaintext\n", []),
-    CheckSum = checksum(Data),
+    CheckSum = pgp_util:checksum(Data),
     Data;
 decrypt_key_data(<<254, CipherAlgorim, Data/binary>>, N, Context) ->
     {S2K, Data1} = pgp_cipher:decode_s2k(Data),
@@ -277,7 +277,7 @@ decrypt_key_data(<<255, CipherAlgorithm, Data/binary>>, N, Context) ->
 	<<CheckSum:16,Data2/binary>> ->
 	    Len = mpi_len(Data2, N),
 	    <<Data3:Len/binary, _ZData/binary>> = Data2,
-	    case checksum(Data3) of
+	    case pgp_util:checksum(Data3) of
 		CheckSum -> Data3;
 		_ -> {error,bad_checksum}
 	    end;
@@ -301,13 +301,6 @@ mpi_len(_, 0, Bytes) ->
     Bytes;
 mpi_len(<<L:16,_:((L+7) div 8)/binary, Rest/binary>>, I, Bytes) ->
     mpi_len(Rest, I-1, Bytes + 2 + ((L+7) div 8)).
-
-%% simple 16 bit sum over bytes 
-checksum(Data) ->
-    checksum(Data, 0).
-checksum(<<>>, Sum) -> Sum rem 16#ffff;
-checksum(<<C,Data/binary>>, Sum) ->
-    checksum(Data, Sum+C).
 
 dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN) -> 
     {rsa,[encrypt,sign]};

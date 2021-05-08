@@ -16,9 +16,12 @@
 -export([decode_mpi_parts/2]).
 -export([decode_mpi_bin/1, decode_mpi_bin/2]).
 -export([encode_mpi/1]).
+-export([encode_mpi_bin/1]).
 -export([encode_mpi_list/1]).
 
-	 
+-export([checksum/1]).
+-export([rand_nonzero_bytes/1]).
+
 -define(UNIX_SECONDS, (719528*24*60*60)).
 
 
@@ -77,7 +80,19 @@ encode_mpi_list([X]) when is_integer(X) ->
 encode_mpi_list(Xs) when is_list(Xs) ->
     iolist_to_binary([encode_mpi(X) || X <- Xs]).
 
-			   
-		       
+%% simple 16 bit sum over bytes 
+checksum(Data) ->
+    checksum(Data, 0).
+checksum(<<>>, Sum) -> Sum rem 16#ffff;
+checksum(<<C,Data/binary>>, Sum) ->
+    checksum(Data, Sum+C).
 
-
+%% do what it says
+rand_nonzero_bytes(N) when is_integer(N), N > 0 ->
+    Random = crypto:strong_rand_bytes(N),
+    case binary:split(Random, <<0>>, [global]) of
+	[R] -> R;  %% no zero
+	Rs ->
+	    M = lists:sum([byte_size(R) || R <- Rs]),
+	    iolist_to_binary([Rs, rand_nonzero_bytes(N-M)])
+    end.

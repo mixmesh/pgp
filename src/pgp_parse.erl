@@ -22,8 +22,9 @@
 %% Section references can be found in
 %% https://tools.ietf.org/pdf/draft-ietf-openpgp-rfc4880bis-10.pdf
 
--define(SIG_VERSION_4, 4).
--define(KEY_VERSION_4, 4).
+-define(SIGNATURE_PACKET_VERSION, 4).
+-define(KEY_PACKET_VERSION, 4).
+-define(PUBLIC_KEY_ENCRYPTED_PACKET_VERSION, 3).
 
 %% Section 4.2: Packets Headers
 -define(OLD_PACKET_FORMAT, 2#10).
@@ -65,37 +66,38 @@
 -define(UID_FIELD_TAG, 16#B4).
 -define(UATTR_FIELD_TAG, 16#D1).
 
-
 -type c14n_key() :: binary().
--type public_key() :: elgamal_public_key() | 
-		      dss_public_key() | 
-		      rsa_public_key().
+
 
 -type rsa_public_key() :: #{ type => rsa,
 			     creation => calendar:datetime(),
 			     e => integer(),
 			     n => integer() }.
--type rsa_private_key() :: #{ type => rsa,
-			      creation => calendar:datetime(),
-			      e => integer(),
-			      n => integer(),
-			      p => integer(),  %% secret prime
-			      q => integer(),  %% secret prime (p<q)
-			      u => integer()   %% (1/p) mod q
-			    }.
+
+-type rsa_secret_key() :: #{ type => rsa,
+			     creation => calendar:datetime(),
+			     e => integer(),
+			     n => integer(),
+			     p => integer(),  %% secret prime
+			     q => integer(),  %% secret prime (p<q)
+			     u => integer()   %% (1/p) mod q
+			   }.
+
 -type elgamal_public_key() :: #{ type => elgamal,
 				 creation => calendar:datetime(),
 				 p => integer(),   %% prime
 				 g => integer(),   %% group generator
 				 y => integer()    %% y=g^x mod p
 			       }.
--type elgamal_private_key() :: #{ type => elgamal,
+
+-type elgamal_secret_key() :: #{ type => elgamal,
 				  creation => calendar:datetime(),
 				  p => integer(),
 				  g => integer(),  
 				  y => integer(),  %% y=g^x mod p
 				  x => integer()   %% secret exponent
 				}.
+
 -type dss_public_key() :: #{ type => dss,
 			     creation => calendar:datetime(),
 			     p => integer(),  %% prime
@@ -103,7 +105,8 @@
 			     g => integer(),  %% group generator
 			     y => integer()   %% y=g^x mod p
 			   }.
--type dss_private_key() :: #{ type => dss,
+
+-type dss_secret_key() :: #{ type => dss,
 			      creation => calendar:datetime(),
 			      p => integer(),
 			      q => integer(),  
@@ -111,6 +114,11 @@
 			      y => integer(),
 			      x => integer()   %% secret exponent
 			    }.
+
+-type private_key() :: rsa_secret_key() | dss_secret_key() | 
+		       elgamal_secret_key().
+-type public_key() :: rsa_public_key() | dss_public_key() | 
+		      elgamal_public_key().
 
 -type packet_type() :: signature | primary_key | subkey | user_id.
 -type user_id() :: binary().
@@ -292,13 +300,16 @@ encode_packets_([Packet|Packets], Acc, Context) ->
 encode_packets_([], Acc, Context) ->
     {iolist_to_binary(lists:reverse(Acc)), Context}.
 
-encode({public_key_encrypted,#{ algorithm := Alg,
-				keyid := KeyID, value := Data }},Context) ->
-    PubKeyAlgorithm = pgp_keys:enc_pubkey_alg(Alg,[encrypt]),
-    %% FIXME: encrypt
+encode({public_key_encrypted,#{ keyid := KeyID, value := Data }},Context) ->
+    #{ keymap := KeyMap } = Context,
+    #{ key := Key } = maps:get(KeyID, KeyMap),
+    #{ type := Type } = Key,
+    PubKeyAlgorithm = pgp_keys:enc_pubkey_alg(Type,[encrypt]),
+    Encrypted = pubkey_encrypt(Key, Data),
     encode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
-		  <<?KEY_VERSION_4, KeyID:8/binary,
-		    PubKeyAlgorithm,Data/binary>>, Context);
+		  <<?PUBLIC_KEY_ENCRYPTED_PACKET_VERSION,
+		    KeyID:8/binary,
+		    PubKeyAlgorithm,Encrypted/binary>>, Context);
 encode({signature, #{ signature_type := SignatureType,
 		      hash_algorithm := HashAlg,
 		      hashed := Hashed,
@@ -334,7 +345,7 @@ encode({signature, #{ signature_type := SignatureType,
     UnHashedSubpacketsLength = byte_size(UnHashedSubpackets),
     HashAlgorithm = pgp_hash:encode(HashAlg),
     encode_packet(?SIGNATURE_PACKET,
-		  <<?SIG_VERSION_4,
+		  <<?SIGNATURE_PACKET_VERSION,
 		    SignatureType,
 		    PublicKeyAlgorithm,
 		    HashAlgorithm,
@@ -515,7 +526,7 @@ decode_new_packet0(<<255, Length:32, Packet:Length/binary,
 
 %% Section 5.1: Public-Key Encrypted Session Key Packet (Tag 2)
 decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
-	      <<?KEY_VERSION_4,
+	      <<?PUBLIC_KEY_ENCRYPTED_PACKET_VERSION,
 		KeyID:8/binary, %% key or subkey
                 Algorithm,
 		Data/binary>>,
@@ -529,7 +540,7 @@ decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
 	     Context);
 %% Section 5.2: Signature Packet (Tag 2)
 decode_packet(?SIGNATURE_PACKET,
-              <<?SIG_VERSION_4,
+              <<?SIGNATURE_PACKET_VERSION,
                 SignatureType,
                 PublicKeyAlgorithm,
                 HashAlgorithm,
@@ -597,19 +608,19 @@ decode_packet(?SIGNATURE_PACKET,
 %% Section 5.5.1.1: Public-Key Packet (Tag 6)
 %% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
 decode_packet(?PUBLIC_KEY_PACKET, 
-	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+	      Data = <<?KEY_PACKET_VERSION,_/binary>>, Context) ->
     decode_public_key_4(key,Data,Context);
 decode_packet(?PUBLIC_SUBKEY_PACKET, 
-	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+	      Data = <<?KEY_PACKET_VERSION,_/binary>>, Context) ->
     decode_public_key_4(subkey,Data,Context);
 
 %% Section 5.5.1.1: Public-Key Packet (Tag 6)
 %% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
 decode_packet(?SECRET_KEY_PACKET, 
-	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+	      Data = <<?KEY_PACKET_VERSION,_/binary>>, Context) ->
     decode_secret_key_4(secret_key,Data,Context);
 decode_packet(?SECRET_SUBKEY_PACKET, 
-	      Data = <<?KEY_VERSION_4,_/binary>>, Context) ->
+	      Data = <<?KEY_PACKET_VERSION,_/binary>>, Context) ->
     decode_secret_key_4(secret_subkey,Data,Context);
 
 %% Section 5.13: User Attribute Packet (Tag 17)
@@ -719,13 +730,13 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
         end,
     HashAlgorithm = pgp_hash:encode(HashAlg),
     FinalData =
-        <<?SIG_VERSION_4,
+        <<?SIGNATURE_PACKET_VERSION,
           SignatureType,
           PublicKeyAlgorithm,
           HashAlgorithm,
           (byte_size(HashedSubpackets)):16,
           HashedSubpackets/binary>>,
-    Trailer = <<?SIG_VERSION_4, 16#FF, (byte_size(FinalData)):32>>,
+    Trailer = <<?SIGNATURE_PACKET_VERSION, 16#FF, (byte_size(FinalData)):32>>,
     crypto:hash_final(
       crypto:hash_update(
         crypto:hash_update(FinalHashState, FinalData), Trailer)).
@@ -1019,13 +1030,6 @@ crypto_signature(_PublicKeyAlgorithm,_Signature) ->
     ?err("unknown_crypto_signature ~p\n",[_PublicKeyAlgorithm]),
     {error,_PublicKeyAlgorithm}.
 
-%% get specified fields from map
-fields([F|Fs], Map) ->
-    [maps:get(F, Map, undefined) | fields(Fs, Map)];
-fields([], _Map) ->
-    [].
-
-
 signature_type_to_signature_level(SignatureType)
   when SignatureType >= 16#11 andalso SignatureType =< 16#13 ->
     [SignatureType - 16#10 + $0];
@@ -1037,6 +1041,36 @@ signature_level_to_signature_type("2") -> 16#12;
 signature_level_to_signature_type("3") -> 16#13;
 signature_level_to_signature_type(_) -> 0.  %%?
 
+pubkey_encrypt(Key, Data) ->
+    case Key of
+	#{ type := rsa, n := N, e := E } ->
+	    %% (M^E mod N)
+	    ok;
+	#{ type := elgamal, p := P, y := Y } ->
+	    ok
+    end.
+
+key_to_em(Cipher, K, SessionKey) ->
+    CipherAlgorithm = pgp_cipher:encode(Cipher),
+    CheckSum = pgp_util:checksum(SessionKey),
+    M = <<CipherAlgorithm, SessionKey/binary, CheckSum:16>>,
+    eme_pckcs1_v1_5_encode(K, M).
+
+eme_pckcs1_v1_5_encode(K, M) when byte_size(M) =< K - 11 ->
+    MLen = byte_size(M),
+    PS = pgp_util:rand_nonzero_bytes(K - MLen - 3),
+    <<16#00, 16#02, PS/binary, 16#00, M/binary>>;
+eme_pckcs1_v1_5_encode(_, _) ->
+    error(message_to_long).
+
+eme_pckcs1_v1_5_decode(<<16#00, 16#02, PSM/binary>>) ->
+    K = byte_size(PSM) + 2,
+    case binary:split(PSM, <<16#00>>) of
+	[PS, M] when byte_size(PS) =:= K - byte_size(M) - 3 ->
+	    M;
+	_ ->
+	    error(decryptio_error)
+    end.
 
 %%
 %% test various packets encodings
