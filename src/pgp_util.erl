@@ -18,12 +18,17 @@
 -export([encode_mpi/1]).
 -export([encode_mpi_bin/1]).
 -export([encode_mpi_list/1]).
+-export([mpi_len/2]).
 
 -export([checksum/1]).
 -export([rand_nonzero_bytes/1]).
+-export([sig_data/1]).
+-export([fingerprint/1]).
+-export([key_id/1]).
+
+-define(KEY_FIELD_TAG, 16#99).
 
 -define(UNIX_SECONDS, (719528*24*60*60)).
-
 
 %% UTC datetime
 timestamp_to_datetime(Timestamp) ->
@@ -37,6 +42,16 @@ timestamp_to_local_datetime(Timestamp) ->
 
 datetime_to_timestamp(UTCDateTime) ->
     calendar:datetime_to_gregorian_seconds(UTCDateTime) - ?UNIX_SECONDS.
+
+%% given number of expected mpi data,
+%% calculate byte length for mpi data + length bytes
+mpi_len(Data, N) ->
+    mpi_len(Data, N, 0).
+mpi_len(_, 0, Bytes) ->
+    Bytes;
+mpi_len(<<L:16,_:((L+7) div 8)/binary, Rest/binary>>, I, Bytes) ->
+    mpi_len(Rest, I-1, Bytes + 2 + ((L+7) div 8)).
+
 
 decode_mpi(<<L:16,Data:((L+7) div 8)/binary>>) ->
     binary:decode_unsigned(Data, big).
@@ -96,3 +111,18 @@ rand_nonzero_bytes(N) when is_integer(N), N > 0 ->
 	    M = lists:sum([byte_size(R) || R <- Rs]),
 	    iolist_to_binary([Rs, rand_nonzero_bytes(N-M)])
     end.
+
+-spec sig_data(KeyData::binary()) -> binary().
+
+sig_data(KeyData) ->
+    <<?KEY_FIELD_TAG, (byte_size(KeyData)):16, KeyData/binary>>.
+
+-spec fingerprint(KeyData::binary()) -> pgp:fingerprint().
+fingerprint(KeyData) ->
+    Data = sig_data(KeyData),
+    crypto:hash(sha, Data).
+
+-spec key_id(KeyData::binary()) -> pgp:keyid().
+key_id(KeyData) ->
+    <<KeyID:8/binary, _/binary>> = fingerprint(KeyData),
+    KeyID.

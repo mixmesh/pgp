@@ -9,6 +9,12 @@
 -module(pgp).
 -compile(export_all).
 
+-export_type([key_id/0, fingerprint/0]).
+
+-type key_id() :: <<_:64>>.       %% 8 bytes key
+-type fingerprint() :: <<_:160>>. %% 20 bytes fingerprint
+
+
 decode_file(Filename) ->
     {ok,Bin} = file:read_file(Filename),
     case pgp_armor:decode(Bin) of

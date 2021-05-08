@@ -23,7 +23,7 @@
 %% -define(dbg(F,A), io:format((F),(A))).
 -define(dbg(F,A), ok).
 
--define(KEY_VERSION_4, 4).
+-define(KEY_PACKET_VERSION, 4).
 
 %% Section 9.1: Public-Key Algorithms
 -define(PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN, 1).  %% GEN/USE
@@ -198,51 +198,69 @@ encrypt_key_data(List, Context) ->
 encode_key_(Algorithm,DateTime,Key) ->
     Timestamp = pgp_util:datetime_to_timestamp(DateTime),
     KeyData = [pgp_util:encode_mpi(X) || X <- Key],
-    <<?KEY_VERSION_4,Timestamp:32,Algorithm,
+    <<?KEY_PACKET_VERSION,Timestamp:32,Algorithm,
       (iolist_to_binary(KeyData))/binary>>.
 
-decode_public_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>) ->
+decode_public_key(KeyData = <<?KEY_PACKET_VERSION,Timestamp:32,
+			      Algorithm,Data/binary>>) ->
+    KeyID = pgp_util:key_id(KeyData),
     Creation = pgp_util:timestamp_to_datetime(Timestamp),
     case dec_pubkey_alg(Algorithm) of
 	{elgamal,Use} ->
 	    [P, G, Y] = pgp_util:decode_mpi_list(Data, 3),
-	    #{ type => elgamal, use => Use, creation => Creation,
+	    #{ type => elgamal, key_id => KeyID,
+		   use => Use, creation => Creation,
 	       p=>P, g=>G, y=>Y };
 	{dsa,Use} ->
 	    [P,Q,G,Y] = pgp_util:decode_mpi_list(Data, 4),
-	    #{ type => dss, use => Use, creation => Creation,
+	    #{ type => dss,  key_id => KeyID,
+	       use => Use, creation => Creation,
 	       p=>P, q=>Q, g=>G, y=>Y }; %% name is dss
 	{rsa,Use} ->
 	    [N,E] = pgp_util:decode_mpi_list(Data, 2),
-	    #{ type => rsa, use => Use,creation => Creation,
+	    #{ type => rsa,  key_id => KeyID,
+	       use => Use,creation => Creation,
 	       e=>E, n=>N }
     end.
 
 decode_secret_key(Data) ->
     decode_secret_key(Data, #{}).
 
-decode_secret_key(<<?KEY_VERSION_4,Timestamp:32,Algorithm,Data/binary>>,
+decode_secret_key(KeyData = <<?KEY_PACKET_VERSION,Timestamp:32,
+			      Algorithm,Data/binary>>,
 		  Context) ->
     Creation = pgp_util:timestamp_to_datetime(Timestamp),
     case dec_pubkey_alg(Algorithm) of
 	{elgamal,Use} ->
+	    PubLen = pgp_util:mpi_len(Data, 3),
+	    <<PubKeyData:(PubLen+6)/binary, _/binary>> = KeyData,
+	    KeyID = pgp_util:key_id(PubKeyData),
 	    {[P, G, Y], Data1} = pgp_util:decode_mpi_parts(Data, 3),
 	    Data2 = decrypt_key_data(Data1, 1, Context),
 	    {[X], <<>>} = pgp_util:decode_mpi_parts(Data2, 1),
-	    #{ type => elgamal, use => Use, creation => Creation,
+	    #{ type => elgamal, key_id => KeyID,
+	       use => Use, creation => Creation,
 	       p=>P, g=>G, y=>Y, x=>X };
 	{dsa,Use} ->
+	    PubLen = pgp_util:mpi_len(Data, 4),
+	    <<PubKeyData:(PubLen+6)/binary, _/binary>> = KeyData,
+	    KeyID = pgp_util:key_id(PubKeyData),
 	    {[P,Q,G,Y], Data1} = pgp_util:decode_mpi_parts(Data, 4),
 	    Data2 = decrypt_key_data(Data1, 1, Context),
 	    ?dbg("Data2[~w] = ~p\n", [byte_size(Data2), Data2]),
 	    {[X], <<>>} = pgp_util:decode_mpi_parts(Data2, 1),
-	    #{ type => dss, use => Use, creation => Creation,
+	    #{ type => dss,  key_id => KeyID,
+	       use => Use, creation => Creation,
 	       p=>P, q=>Q, g=>G, y=>Y, x=>X }; %% name is dss
 	{rsa,Use} ->
+	    PubLen = pgp_util:mpi_len(Data, 2),
+	    <<PubKeyData:(PubLen+6)/binary, _/binary>> = KeyData,
+	    KeyID = pgp_util:key_id(PubKeyData),
 	    {[N,E],Data1} = pgp_util:decode_mpi_parts(Data, 2),
 	    Data2 = decrypt_key_data(Data1, 4, Context),
 	    {[D,P,Q,U],<<>>} = pgp_util:decode_mpi_parts(Data2, 4),
-	    #{ type => rsa, use => Use,creation => Creation,
+	    #{ type => rsa, key_id => KeyID,
+	       use => Use,creation => Creation,
 	       e=>E, n=>N, d=>D, p=>P, q=>Q, u=>U }
     end.
 
@@ -257,7 +275,7 @@ decrypt_key_data(<<254, CipherAlgorim, Data/binary>>, N, Context) ->
     Password = maps:get(password, Context),
     case pgp_cipher:decrypt(Cipher,S2K,Data1,Password) of
 	<<Hash:20/binary, Data2/binary>> ->
-	    Len = mpi_len(Data2, N),
+	    Len = pgp_util:mpi_len(Data2, N),
 	    <<Data3:Len/binary, _ZData/binary>> = Data2,
 	    ?dbg("Data3[~w] = ~p\n", [byte_size(Data3), Data3]),
 	    case crypto:hash(sha, Data3) of
@@ -275,7 +293,7 @@ decrypt_key_data(<<255, CipherAlgorithm, Data/binary>>, N, Context) ->
     Password = maps:get(password, Context),
     case pgp_cipher:decrypt(Cipher,S2K,Data1,Password) of
 	<<CheckSum:16,Data2/binary>> ->
-	    Len = mpi_len(Data2, N),
+	    Len = pgp_util:mpi_len(Data2, N),
 	    <<Data3:Len/binary, _ZData/binary>> = Data2,
 	    case pgp_util:checksum(Data3) of
 		CheckSum -> Data3;
@@ -289,18 +307,10 @@ decrypt_key_data(<<CipherAlgorithm, Data/binary>>, N, Context) ->
     ?dbg("decrypt_key_data: s2k=~w, cipher=~w\n", [{simple,md5},Cipher]),
     Password = maps:get(password, Context),
     Data2 = pgp_cipher:decrypt(Cipher,{simple,md5},Data,Password),
-    Len = mpi_len(Data2, N),
+    Len = pgp_util:mpi_len(Data2, N),
     <<Data3:Len/binary, _ZData/binary>> = Data2,
     Data3.
 
-%% given number of expected mpi data,
-%% calculate byte length for mpi data + length bytes
-mpi_len(Data, N) ->
-    mpi_len(Data, N, 0).
-mpi_len(_, 0, Bytes) ->
-    Bytes;
-mpi_len(<<L:16,_:((L+7) div 8)/binary, Rest/binary>>, I, Bytes) ->
-    mpi_len(Rest, I-1, Bytes + 2 + ((L+7) div 8)).
 
 dec_pubkey_alg(?PUBLIC_KEY_ALGORITHM_RSA_ENCRYPT_OR_SIGN) -> 
     {rsa,[encrypt,sign]};

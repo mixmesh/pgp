@@ -10,6 +10,8 @@
 
 -export([decode_stream/2, decode_stream/1]).
 -export([decode_signature_packet/1]).
+
+%% moved to util
 -export([fingerprint/1, key_id/1, encode_key/1]).
 
 -include("OpenSSL.hrl").
@@ -60,60 +62,78 @@
 -define(FEATURES, 30).
 -define(ISSUER_FINGERPRINT, 33).
 
-
 %% data tags
--define(KEY_FIELD_TAG, 16#99).
 -define(UID_FIELD_TAG, 16#B4).
 -define(UATTR_FIELD_TAG, 16#D1).
 
+-type user_id() :: binary().
+-type user_attribute() :: binary().
+-type key_use() :: [ encrypt | sign].
 -type c14n_key() :: binary().
 
+-type rsa_public_key() :: 
+	#{ type => rsa,
+	   keyid => pgp:key_id(),
+	   use => key_use(),
+	   creation => calendar:datetime(),
+	   e => integer(),
+	   n => integer() }.
 
--type rsa_public_key() :: #{ type => rsa,
-			     creation => calendar:datetime(),
-			     e => integer(),
-			     n => integer() }.
+-type rsa_secret_key() ::
+	#{ type => rsa,
+	   keyid => pgp:key_id(),
+	   use => key_use(),
+	   creation => calendar:datetime(),
+	   e => integer(),
+	   n => integer(),
+	   p => integer(),  %% secret prime
+	   q => integer(),  %% secret prime (p<q)
+	   u => integer()   %% (1/p) mod q
+	 }.
 
--type rsa_secret_key() :: #{ type => rsa,
-			     creation => calendar:datetime(),
-			     e => integer(),
-			     n => integer(),
-			     p => integer(),  %% secret prime
-			     q => integer(),  %% secret prime (p<q)
-			     u => integer()   %% (1/p) mod q
-			   }.
+-type elgamal_public_key() ::
+	#{ type => elgamal,
+	   keyid => pgp:key_id(),
+	   use => key_use(),
+	   creation => calendar:datetime(),
+	   p => integer(),   %% prime
+	   g => integer(),   %% group generator
+	   y => integer()    %% y=g^x mod p
+	 }.
 
--type elgamal_public_key() :: #{ type => elgamal,
-				 creation => calendar:datetime(),
-				 p => integer(),   %% prime
-				 g => integer(),   %% group generator
-				 y => integer()    %% y=g^x mod p
-			       }.
+-type elgamal_secret_key() :: 
+	#{ type => elgamal,
+	   keyid => pgp:key_id(),
+	   use => key_use(),
+	   creation => calendar:datetime(),
+	   p => integer(),
+	   g => integer(),  
+	   y => integer(),  %% y=g^x mod p
+	   x => integer()   %% secret exponent
+	 }.
 
--type elgamal_secret_key() :: #{ type => elgamal,
-				  creation => calendar:datetime(),
-				  p => integer(),
-				  g => integer(),  
-				  y => integer(),  %% y=g^x mod p
-				  x => integer()   %% secret exponent
-				}.
+-type dss_public_key() :: 
+	#{ type => dss,
+	   keyid => pgp:key_id(),
+	   use => key_use(),
+	   creation => calendar:datetime(),
+	   p => integer(),  %% prime
+	   q => integer(),  %% q prime divisor of p-1
+	   g => integer(),  %% group generator
+	   y => integer()   %% y=g^x mod p
+	 }.
 
--type dss_public_key() :: #{ type => dss,
-			     creation => calendar:datetime(),
-			     p => integer(),  %% prime
-			     q => integer(),  %% q prime divisor of p-1
-			     g => integer(),  %% group generator
-			     y => integer()   %% y=g^x mod p
-			   }.
-
--type dss_secret_key() :: #{ type => dss,
-			      creation => calendar:datetime(),
-			      p => integer(),
-			      q => integer(),  
-			      g => integer(),  
-			      y => integer(),
-			      x => integer()   %% secret exponent
-			    }.
+-type dss_secret_key() :: 
+	#{ type => dss,
+	   keyid => pgp:key_id(),
+	   use => key_use(),
+	   creation => calendar:datetime(),
+	   p => integer(),
+	   q => integer(),  
+	   g => integer(),  
+	   y => integer(),
+	   x => integer()   %% secret exponent
+	 }.
 
 -type private_key() :: rsa_secret_key() | dss_secret_key() | 
 		       elgamal_secret_key().
@@ -121,8 +141,6 @@
 		      elgamal_public_key().
 
 -type packet_type() :: signature | primary_key | subkey | user_id.
--type user_id() :: binary().
--type user_attribute() :: binary().
 
 -type cb_params() :: cb_signature() |
 		     cb_key() |
@@ -171,6 +189,11 @@
 	  skip_signature_check => boolean(),
 	  critical => boolean()
 	 }.
+
+sig_data(Data) -> pgp_util:sig_data(Data).
+fingerprint(KeyData) -> pgp_util:fingerprint(KeyData).
+key_id(KeyData) -> pgp_util:key_id(KeyData).
+    
 
 -spec new_context(Handler::fun(), HandlerState::any()) ->
 	  decoder_ctx().
@@ -256,23 +279,12 @@ dsp_handler(signature, [_|Params], []) ->
 dsp_handler(_, _, State) ->
     State.
 
-sig_data(KeyData) ->
-    <<?KEY_FIELD_TAG, (byte_size(KeyData)):16, KeyData/binary>>.
-
-fingerprint(KeyData) ->
-    Data = sig_data(KeyData),
-    crypto:hash(sha, Data).
-
-key_id(KeyData) ->
-    <<KeyID:8/binary, _/binary>> = fingerprint(KeyData),
-    KeyID.
-
 %% Exported: encode_key
 
 encode_key(KeyData) ->
     encode_key(KeyData, ?PUBLIC_KEY_PACKET).
 encode_key(KeyData, KeyTag) ->
-    Id = key_id(KeyData),
+    Id = pgp_util:key_id(KeyData),
     PK = encode_old_packet(KeyTag, KeyData),
     Signatures =
         << <<(encode_old_packet(?USER_ID_PACKET, UserId))/binary,
@@ -655,14 +667,14 @@ decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
 %% version 4
 decode_public_key_4(key, KeyData, Context) ->
     Key = pgp_keys:decode_public_key(KeyData),
-    KeyID = key_id(KeyData),
+    #{ key_id := KeyID } = Key,
     callback(key, #{ key => Key,
 		     key_id => KeyID,
 		     key_data => KeyData }, 
 	     Context#{ key => Key, key_data => KeyData });
 decode_public_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
     Key = pgp_keys:decode_public_key(KeyData),
-    KeyID = key_id(KeyData),
+    #{ key_id := KeyID } = Key,
     callback(subkey, #{ subkey => Key, 
 			subkey_id => KeyID,
 			subkey_data => KeyData,
@@ -673,14 +685,14 @@ decode_public_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
 %% version 4
 decode_secret_key_4(secret_key, KeyData, Context) ->
     Key = pgp_keys:decode_secret_key(KeyData),
-    KeyID = key_id(KeyData), %% fixme? public?
+    #{ key_id := KeyID } = Key, %% not needed ! remove this soon
     callback(secret_key, #{ key => Key,
 			    key_id => KeyID,
 			    key_data => KeyData }, 
 	     Context#{ key => Key, key_data => KeyData });
 decode_secret_key_4(secret_subkey,KeyData,Context = #{ key := PrimaryKey }) ->
     Key = pgp_keys:decode_secret_key(KeyData),
-    KeyID = key_id(KeyData), %% fixme? public?
+    #{ key_id := KeyID } = Key,  %% not needed ! remove this soon
     callback(secret_subkey, #{ subkey => Key, 
 			       subkey_id => KeyID,
 			       subkey_data => KeyData,
@@ -701,8 +713,8 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
             %% 0x19: Primary Key Binding Signature
             KeyBinding when KeyBinding =:= 16#18 orelse KeyBinding =:= 16#19 ->
 		#{ key_data := KeyData, subkey_data := SubkeyData } = Context,
-		SigKeyData = sig_data(KeyData),
-		SigSubkeyData = sig_data(SubkeyData),		
+		SigKeyData = pgp_util:sig_data(KeyData),
+		SigSubkeyData = pgp_util:sig_data(SubkeyData),		
                 crypto:hash_update(
                   crypto:hash_update(HashState, SigKeyData), SigSubkeyData);
             %% 0x10: Generic certification of a User ID and Public-Key packet
@@ -714,7 +726,7 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
                                 Certification =< 16#13) orelse
                                Certification == 16#30 ->
 		#{ key_data := KeyData, user_id := UID } = Context,
-		SigKeyData = sig_data(KeyData),
+		SigKeyData = pgp_util:sig_data(KeyData),
                 UserId =
 		    case maps:get(user_attribute, Context, undefined) of
 			undefined ->
@@ -861,11 +873,11 @@ encode_subpacket({signature_creation_time,Param=#{ value := DateTime }},
 
 encode_subpacket({issuer,self}, Context) ->
     #{ key_data := KeyData } = Context,
-    Issuer = key_id(KeyData),
+    Issuer = pgp_util:key_id(KeyData),
     encode_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,#{},Context);
 encode_subpacket({issuer,primary}, Context) ->
     #{ key_data := KeyData } = Context,
-    Issuer = key_id(KeyData),
+    Issuer = pgp_util:key_id(KeyData),
     encode_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,#{},Context);
 encode_subpacket({issuer,Param=#{ value := Issuer }}, Context) ->
     encode_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,Param,Context);
@@ -988,7 +1000,8 @@ verify_signature_packet(PublicKeyAlg, HashAlg, Hash, Signature,
 		_ when SignatureType >= 16#10 andalso SignatureType =< 16#13 ->
 		    #{ issuer := Issuer, key_data := KeyData,
 		       key := CryptoKey } = Context,
-		    KeyID = key_id(KeyData),
+		    #{ key_id := KeyID } = CryptoKey,
+		    %% KeyID = pgp_util:key_id(KeyData),
 		    ?dbg("KeyID: ~w, Issuer=~w\n", [KeyID,Issuer]),
 		    case prefix(KeyID, Issuer) of
 			true ->
@@ -1045,9 +1058,9 @@ pubkey_encrypt(Key, Data) ->
     case Key of
 	#{ type := rsa, n := N, e := E } ->
 	    %% (M^E mod N)
-	    ok;
+	    <<"nope">>;
 	#{ type := elgamal, p := P, y := Y } ->
-	    ok
+	    <<"nope">>
     end.
 
 key_to_em(Cipher, K, SessionKey) ->
@@ -1069,7 +1082,7 @@ eme_pckcs1_v1_5_decode(<<16#00, 16#02, PSM/binary>>) ->
 	[PS, M] when byte_size(PS) =:= K - byte_size(M) - 3 ->
 	    M;
 	_ ->
-	    error(decryptio_error)
+	    error(decryption_error)
     end.
 
 %%
