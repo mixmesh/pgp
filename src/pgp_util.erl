@@ -9,8 +9,7 @@
 
 -export([timestamp_to_datetime/1,
 	 timestamp_to_local_datetime/1,
-	 datetime_to_timestamp/1,
-         encode_mpi_bin/1]).
+	 datetime_to_timestamp/1]).
 
 -export([decode_mpi/1]).
 -export([decode_mpi_list/2]).
