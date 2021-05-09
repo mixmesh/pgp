@@ -51,11 +51,15 @@ generate_rsa_key() ->
 generate_rsa_key(ModulusSizeInBits, PublicExponent) ->
     {[E,N],[E, N, D, P1, P2, _E1, _E2, C]} =
 	crypto:generate_key(rsa, {ModulusSizeInBits, PublicExponent}),
-    Public = #{ type => rsa,
+    Public0 = #{ type => rsa,
 		use => [encrypt,sign],
 		creation => calendar:universal_time(),
 		e => binary:decode_unsigned(E, big),
 		n => binary:decode_unsigned(N, big) },
+    KeyData = encode_public_key(Public0),
+    Fingerprint = pgp_util:fingerprint(KeyData),
+    KeyID = pgp_util:fingerprint_to_key_id(Fingerprint),
+    Public = Public0#{ fingerprint => Fingerprint, key_id => KeyID },
     Private = Public#{ d => binary:decode_unsigned(D, big),
 		       p => binary:decode_unsigned(P1, big),
 		       q => binary:decode_unsigned(P2, big),
@@ -112,12 +116,16 @@ generate_dh_key__(Type, Use, P, Q, G) ->
     Y = binary:decode_unsigned(Yb, big),
     X = binary:decode_unsigned(Xb, big),
     Y = mpz:powm(G, X, P),  %% validation
-    Public = #{ type => Type, use => Use,
+    Public0 = #{ type => Type, use => Use,
 		creation => calendar:universal_time(),
 		p => P,
 		q => Q,
 		g => G,
 		y => Y },
+    KeyData = encode_public_key(Public0),
+    Fingerprint = pgp_util:fingerprint(KeyData),
+    KeyID = pgp_util:fingerprint_to_key_id(Fingerprint),
+    Public = Public0#{ fingerprint => Fingerprint, key_id => KeyID },
     Private = Public#{ x => X },
     {Public, Private }.
 
@@ -203,22 +211,23 @@ encode_key_(Algorithm,DateTime,Key) ->
 
 decode_public_key(KeyData = <<?KEY_PACKET_VERSION,Timestamp:32,
 			      Algorithm,Data/binary>>) ->
-    KeyID = pgp_util:key_id(KeyData),
+    Fingerprint = pgp_util:fingerprint(KeyData),
+    KeyID = pgp_util:fingerprint_to_key_id(Fingerprint),
     Creation = pgp_util:timestamp_to_datetime(Timestamp),
     case dec_pubkey_alg(Algorithm) of
 	{elgamal,Use} ->
 	    [P, G, Y] = pgp_util:decode_mpi_list(Data, 3),
-	    #{ type => elgamal, key_id => KeyID,
+	    #{ type => elgamal, fingerprint => Fingerprint, key_id => KeyID, 
 		   use => Use, creation => Creation,
 	       p=>P, g=>G, y=>Y };
 	{dsa,Use} ->
 	    [P,Q,G,Y] = pgp_util:decode_mpi_list(Data, 4),
-	    #{ type => dss,  key_id => KeyID,
+	    #{ type => dss, fingerprint => Fingerprint, key_id => KeyID,
 	       use => Use, creation => Creation,
 	       p=>P, q=>Q, g=>G, y=>Y }; %% name is dss
 	{rsa,Use} ->
 	    [N,E] = pgp_util:decode_mpi_list(Data, 2),
-	    #{ type => rsa,  key_id => KeyID,
+	    #{ type => rsa, fingerprint => Fingerprint, key_id => KeyID,
 	       use => Use,creation => Creation,
 	       e=>E, n=>N }
     end.
@@ -234,32 +243,35 @@ decode_secret_key(KeyData = <<?KEY_PACKET_VERSION,Timestamp:32,
 	{elgamal,Use} ->
 	    PubLen = pgp_util:mpi_len(Data, 3),
 	    <<PubKeyData:(PubLen+6)/binary, _/binary>> = KeyData,
-	    KeyID = pgp_util:key_id(PubKeyData),
+	    Fingerprint = pgp_util:fingerprint(PubKeyData),
+	    KeyID = pgp_util:fingerprint_to_key_id(Fingerprint),
 	    {[P, G, Y], Data1} = pgp_util:decode_mpi_parts(Data, 3),
 	    Data2 = decrypt_key_data(Data1, 1, Context),
 	    {[X], <<>>} = pgp_util:decode_mpi_parts(Data2, 1),
-	    #{ type => elgamal, key_id => KeyID,
+	    #{ type => elgamal, fingerprint => Fingerprint, key_id => KeyID,
 	       use => Use, creation => Creation,
 	       p=>P, g=>G, y=>Y, x=>X };
 	{dsa,Use} ->
 	    PubLen = pgp_util:mpi_len(Data, 4),
 	    <<PubKeyData:(PubLen+6)/binary, _/binary>> = KeyData,
-	    KeyID = pgp_util:key_id(PubKeyData),
+	    Fingerprint = pgp_util:fingerprint(PubKeyData),
+	    KeyID = pgp_util:fingerprint_to_key_id(Fingerprint),
 	    {[P,Q,G,Y], Data1} = pgp_util:decode_mpi_parts(Data, 4),
 	    Data2 = decrypt_key_data(Data1, 1, Context),
 	    ?dbg("Data2[~w] = ~p\n", [byte_size(Data2), Data2]),
 	    {[X], <<>>} = pgp_util:decode_mpi_parts(Data2, 1),
-	    #{ type => dss,  key_id => KeyID,
+	    #{ type => dss,  fingerprint => Fingerprint, key_id => KeyID,
 	       use => Use, creation => Creation,
 	       p=>P, q=>Q, g=>G, y=>Y, x=>X }; %% name is dss
 	{rsa,Use} ->
 	    PubLen = pgp_util:mpi_len(Data, 2),
 	    <<PubKeyData:(PubLen+6)/binary, _/binary>> = KeyData,
-	    KeyID = pgp_util:key_id(PubKeyData),
+	    Fingerprint = pgp_util:fingerprint(PubKeyData),
+	    KeyID = pgp_util:fingerprint_to_key_id(Fingerprint),
 	    {[N,E],Data1} = pgp_util:decode_mpi_parts(Data, 2),
 	    Data2 = decrypt_key_data(Data1, 4, Context),
 	    {[D,P,Q,U],<<>>} = pgp_util:decode_mpi_parts(Data2, 4),
-	    #{ type => rsa, key_id => KeyID,
+	    #{ type => rsa, fingerprint => Fingerprint, key_id => KeyID,
 	       use => Use,creation => Creation,
 	       e=>E, n=>N, d=>D, p=>P, q=>Q, u=>U }
     end.

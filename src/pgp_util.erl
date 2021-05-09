@@ -25,6 +25,8 @@
 -export([sig_data/1]).
 -export([fingerprint/1]).
 -export([key_id/1]).
+-export([fingerprint_to_key_id/1]).
+
 
 -define(KEY_FIELD_TAG, 16#99).
 
@@ -122,7 +124,14 @@ fingerprint(KeyData) ->
     Data = sig_data(KeyData),
     crypto:hash(sha, Data).
 
--spec key_id(KeyData::binary()) -> pgp:keyid().
+-spec key_id(KeyData::binary()) -> pgp:key_id().
 key_id(KeyData) ->
     <<KeyID:8/binary, _/binary>> = fingerprint(KeyData),
     KeyID.
+
+-spec fingerprint_to_key_id(Fingerprint::pgp:fingerprint()) -> pgp:key_id().
+fingerprint_to_key_id(Fingerprint) ->
+    <<KeyID:8/binary, _/binary>> = Fingerprint,
+    KeyID.
+
+			   

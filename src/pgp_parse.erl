@@ -27,6 +27,7 @@
 -define(SIGNATURE_PACKET_VERSION, 4).
 -define(KEY_PACKET_VERSION, 4).
 -define(PUBLIC_KEY_ENCRYPTED_PACKET_VERSION, 3).
+-define(SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET_VERSION, 4).
 
 %% Section 4.2: Packets Headers
 -define(OLD_PACKET_FORMAT, 2#10).
@@ -35,6 +36,7 @@
 %% Section 4.3: Packets Tags
 -define(PUBLIC_KEY_ENCRYPTED_PACKET, 1).
 -define(SIGNATURE_PACKET, 2).
+-define(SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET, 3).
 -define(SECRET_KEY_PACKET, 5).
 -define(PUBLIC_KEY_PACKET, 6).
 -define(SECRET_SUBKEY_PACKET, 7).
@@ -68,77 +70,10 @@
 
 -type user_id() :: binary().
 -type user_attribute() :: binary().
--type key_use() :: [ encrypt | sign].
 -type c14n_key() :: binary().
-
--type rsa_public_key() :: 
-	#{ type => rsa,
-	   keyid => pgp:key_id(),
-	   use => key_use(),
-	   creation => calendar:datetime(),
-	   e => integer(),
-	   n => integer() }.
-
--type rsa_secret_key() ::
-	#{ type => rsa,
-	   keyid => pgp:key_id(),
-	   use => key_use(),
-	   creation => calendar:datetime(),
-	   e => integer(),
-	   n => integer(),
-	   p => integer(),  %% secret prime
-	   q => integer(),  %% secret prime (p<q)
-	   u => integer()   %% (1/p) mod q
-	 }.
-
--type elgamal_public_key() ::
-	#{ type => elgamal,
-	   keyid => pgp:key_id(),
-	   use => key_use(),
-	   creation => calendar:datetime(),
-	   p => integer(),   %% prime
-	   g => integer(),   %% group generator
-	   y => integer()    %% y=g^x mod p
-	 }.
-
--type elgamal_secret_key() :: 
-	#{ type => elgamal,
-	   keyid => pgp:key_id(),
-	   use => key_use(),
-	   creation => calendar:datetime(),
-	   p => integer(),
-	   g => integer(),  
-	   y => integer(),  %% y=g^x mod p
-	   x => integer()   %% secret exponent
-	 }.
-
--type dss_public_key() :: 
-	#{ type => dss,
-	   keyid => pgp:key_id(),
-	   use => key_use(),
-	   creation => calendar:datetime(),
-	   p => integer(),  %% prime
-	   q => integer(),  %% q prime divisor of p-1
-	   g => integer(),  %% group generator
-	   y => integer()   %% y=g^x mod p
-	 }.
-
--type dss_secret_key() :: 
-	#{ type => dss,
-	   keyid => pgp:key_id(),
-	   use => key_use(),
-	   creation => calendar:datetime(),
-	   p => integer(),
-	   q => integer(),  
-	   g => integer(),  
-	   y => integer(),
-	   x => integer()   %% secret exponent
-	 }.
-
--type private_key() :: rsa_secret_key() | dss_secret_key() | 
-		       elgamal_secret_key().
--type public_key() :: rsa_public_key() | dss_public_key() | 
-		      elgamal_public_key().
+-type s2k_type() :: {simple, pgp_hash:alg()} |
+		    {salted, pgp_hash:alg(), Salt::binary()} |
+		    {salted, pgp_hash:alg(), Salt::binary(), Count::integer()}.
 
 -type packet_type() :: signature | primary_key | subkey | user_id.
 
@@ -158,14 +93,14 @@
 	 }.
 -type cb_key() :: 
 	#{ 
-	   key => public_key(),
+	   key => pgp:public_key(),
 	   key_data => binary()
 	 }.
 -type cb_subkey() :: 
 	#{ 
-	   subkey => public_key(),
+	   subkey => pgp:public_key(),
 	   subkey_data => binary(),
-	   key => public_key(),
+	   key => pgp:public_key(),
 	   user_id => binary()
 	 }.
 -type cb_user_id() :: 
@@ -177,8 +112,10 @@
 	  handler => fun((Type::atom(),Ps::cb_params(),S0::any()) -> S1::any()),
 	  handler_state => any(),
 	  %% various fields depending on packet type processed
-	  primary_key => {c14n_key(), public_key()} | undefined,
-	  subkey => {c14n_key(), public_key()} | undefined,
+	  key => {c14n_key(), pgp:public_key()} | undefined,
+	  subkey => {c14n_key(), pgp:public_key()} | undefined,
+	  symmeric_key => binary() | undefined,
+	  s2k => s2k_type(),
 	  user_id => user_id() | undefined,
 	  user_attribute => user_attribute() | undefined,
 	  issuer => binary()  | undefined,
@@ -312,24 +249,31 @@ encode_packets_([Packet|Packets], Acc, Context) ->
 encode_packets_([], Acc, Context) ->
     {iolist_to_binary(lists:reverse(Acc)), Context}.
 
-encode({public_key_encrypted,#{ keyid := KeyID, 
-				cipher := Cipher,
-				value := Data }},Context) ->
+encode({public_key_encrypted,#{ keyid := KeyID, cipher := Cipher }},Context) ->
     Key = case maps:get(KeyID, Context, undefined) of
 	      undefined ->
-		  Keylookup = maps:get(keylookup, Context),
-		  Keylookup(KeyID);
+		  KeylookupFun = maps:get(keylookup_fun, Context),
+		  KeylookupFun(KeyID, Context);
 	      Key0 ->
 		  Key0
 	  end,
     #{ type := Type } = Key,
     PubKeyAlgorithm = pgp_keys:enc_pubkey_alg(Type,[encrypt]),
+    #{ key_length := KeyLength } = crypto:cipher_info(Cipher),
+    {SymmetricKey,Context1} =
+	case maps:get(symmetric_key, Context, undefined) of
+	    undefined ->
+		SymKey = crypto:strong_rand_bytes(KeyLength),
+		{SymKey,Context#{ symmetric_key => SymKey, cipher => Cipher }}; 
+	    <<SymKey:KeyLength/binary,_/binary>> -> %% match equal?
+		{SymKey, Context#{ cipher => Cipher }}
+	end,
     %% create password, encrypt that password with public key encryption
-    Encrypted = pubkey_encrypt(Key, Cipher, Data),
+    Encrypted = pubkey_encrypt(Key, Cipher, SymmetricKey),
     encode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
 		  <<?PUBLIC_KEY_ENCRYPTED_PACKET_VERSION,
 		    KeyID:8/binary,
-		    PubKeyAlgorithm,Encrypted/binary>>, Context);
+		    PubKeyAlgorithm,Encrypted/binary>>, Context1);
 encode({signature, #{ signature_type := SignatureType,
 		      hash_algorithm := HashAlg,
 		      hashed := Hashed,
@@ -376,6 +320,38 @@ encode({signature, #{ signature_type := SignatureType,
 		    SignedHashLeft16:2/binary,
 		    Signature/binary >>, Context2);
 
+encode({symmetric_key_encrypted_session_key, Param}, Context) ->
+    %% FIXME use preferred
+    Cipher = maps:get(cipher, Context, des_ede3_cbc),
+    CipherAlgorithm = pgp_cihper:encode(Cipher),
+    S2K = maps:get(s2k, Context, {simple, md5}),
+    Password =
+	case maps:get(password, Context, undefined) of
+	    undefined ->
+		PasswordFun = maps:get(password_fun, Context),
+		%% Update context?
+		PasswordFun(Context);
+	    Pass ->
+		Pass
+	end,
+    Key = pgp_cipher:string_to_key(S2K, Cipher, Password),
+    {Data,Context1}
+	= case maps:get(symmetric_key, Param, undefined) of
+	      undefined ->
+		  %% use the password key it self
+		  {<<>>, Context#{ symmetric_key => Key }};
+	      SymmetricKey ->
+		  #{ iv_length := IVLength, block_size := BlockSize } = 
+		      crypto:cipher_info(Cipher),
+		  IVZ = <<0:IVLength/unit:8>>,
+		  State = crypto:crypto_init(Cipher,Key,IVZ,[{encrypt,true}]),
+		  Data0 = <<CipherAlgorithm, SymmetricKey/binary>>,
+		  {pgp_cipher:cipher_data(State,BlockSize,Data0),Context}
+	  end,
+    encode_packet(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
+		  <<?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET_VERSION,
+		    CipherAlgorithm, Data/binary>>, Context1);
+
 encode({literal_data,#{ format := Format,
 		       value := Data }}, Context) ->
     encode_packet(?LITERAL_DATA_PACKET, <<Format,Data/binary>>, Context);
@@ -411,9 +387,19 @@ encode({user_id, #{ value := UserId }}, Context) ->
     %% encode for signature/hash
     UID = <<?UID_FIELD_TAG, Len:32, UserId/binary>>,
     encode_packet(?USER_ID_PACKET, UserId, Context#{ user_id => UID});
-encode({encrypted, #{ value := _Data}}, Context) ->
+encode({encrypted,Packets}, Context) ->
     %% FIXME: encrypt data using data from context and params
-    encode_packet(?ENCRYPTED_PACKET, <<>>, Context);
+    {Data, Context1} = encode_packets(Packets, Context),
+    #{ cipher := Cipher, symmetric_key := SymmetricKey } = Context1,
+    #{ iv_length := IVLength, block_size := BlockSize } =
+	crypto:cipher_info(Cipher),
+    IVZ = <<0:IVLength/unit:8>>,
+    State = crypto:crypto_init(Cipher,SymmetricKey,IVZ,[{encrypt,true}]),
+    Prefix = symmetric_prefix(BlockSize),
+    %% FIXME: encrypt prefix one round and reset?
+    Data1 = <<Prefix/binary,Data/binary>>,
+    Data2 = pgp_cipher:cipher_data(State,BlockSize,Data1),
+    encode_packet(?ENCRYPTED_PACKET, Data2, Context1);
 encode({encrypted_protected, #{ version := _Version,value := _Data}},
        Context) ->
     %% FIXME: encrypt data using data from context and params
@@ -422,6 +408,11 @@ encode({encrypted_protected, #{ version := _Version,value := _Data}},
 compress_packet(PreferedAlgorithms, Data, Context) ->
     {Algorithm,Data1} = pgp_compress:compress(PreferedAlgorithms, Data),
     encode_packet(?COMPRESSED_PACKET, <<Algorithm,Data1/binary>>, Context).
+
+symmetric_prefix(BlockSize) ->
+    Rand = crypto:strong_rand_bytes(BlockSize),
+    <<_:(BlockSize-2)/binary,Rep:2/binary>> = Rand,
+    <<Rand/binary, Rep/binary>>.
 
 %%
 %% Encode packet
@@ -551,13 +542,25 @@ decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
                 Algorithm,
 		Data/binary>>,
 	      Context) ->
-    {Alg,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
+    SecretKey = case maps:get(KeyID, Context, undefined) of
+		  undefined ->
+		      KeylookupFun = maps:get(keylookup_fun, Context),
+		      KeylookupFun(KeyID, secret, Context);
+		  Key0 ->
+		      Key0
+	      end,
+    #{ type := Type } = SecretKey,
+    {Type,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
+    {SymmetricKey,Cipher} = pubkey_decrypt(SecretKey, Data),
     callback(public_key_encrypted, 
-	     #{ algorithm => Alg,
+	     #{ algorithm => Type,
+		symmetric_key => SymmetricKey,
+		cipher => Cipher,
 		use => Use,  %% check encrypt?
-		keyid => KeyID,
-		value => Data },
-	     Context);
+		keyid => KeyID },
+	     Context#{ symmetric_key => SymmetricKey,
+		       cipher => Cipher });
+
 %% Section 5.2: Signature Packet (Tag 2)
 decode_packet(?SIGNATURE_PACKET,
               <<?SIGNATURE_PACKET_VERSION,
@@ -625,6 +628,41 @@ decode_packet(?SIGNATURE_PACKET,
 	      issuer,
 	      key_expiration],
 	     Context8);
+
+decode_packet(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
+	      <<?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET_VERSION,
+		CipherAlgorithm, Data/binary>>, Context) ->
+    Cipher = pgp_cipher:decode(CipherAlgorithm),
+    {S2K, Data1} = pgp_cipher:decode_s2k(Data),
+    Password =
+	case maps:get(password, Context, undefined) of
+	    undefined ->
+		PasswordFun = maps:get(password_fun, Context),
+		PasswordFun(Context);
+	    Pass ->
+		Pass
+	end,
+    Key = pgp_cipher:string_to_key(S2K, Cipher, Password),
+    SymmetricKey =
+	case Data1 of
+	    <<>> ->
+		Key;
+	    Encrypted ->
+		#{ iv_length := IVLength, block_size := BlockSize } = 
+		    crypto:cipher_info(Cipher),
+		IVZ = <<0:IVLength/unit:8>>,
+		State = crypto:crypto_init(Cipher,Key,IVZ,[{encrypt,false}]),
+		case pgp_cipher:cipher_data(State, BlockSize, Encrypted) of
+		    <<CipherAlgorithm,SymKey/binary>> ->
+			SymKey;
+		    _ ->
+			error(decryption_failed)
+		end
+	end,
+    callback(symmetric_key_encrypted_session_key,
+	     #{ value => SymmetricKey }, [],
+	     Context# { symmetric_key => SymmetricKey });
+	      
 %% Section 5.5.1.1: Public-Key Packet (Tag 6)
 %% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
 decode_packet(?PUBLIC_KEY_PACKET, 
@@ -1070,7 +1108,8 @@ pubkey_encrypt(Key, Cipher, SessionKey) ->
 	    M = binary:decode_unsigned(MBin, big),
 	    pgp_util:encode_mpi(mpz:powm(M, E, N));
 	#{ type := elgamal, p := P, g := G, y := Y } ->
-	    K = byte_size(binary:encode_unsigned(P, big)),
+	    Q = (P-1) div 2,
+	    K = rand:uniform(Q) -1,
 	    EM = key_to_em(Cipher, SessionKey),
 	    MBin = eme_pckcs1_v1_5_encode(K, EM),
 	    M = binary:decode_unsigned(MBin, big),
@@ -1079,10 +1118,33 @@ pubkey_encrypt(Key, Cipher, SessionKey) ->
 	    pgp_utl:encode_mpi_list([Gk,MYk])
     end.
 
+pubkey_decrypt(SecretKey, Data) ->
+    case SecretKey of
+	#{ type := rsa, n := N, d := D } ->
+	    [C] = pgp_util:decode_mpi_list(Data,1),
+	    M0 = mpz:powm(C, D, N),
+	    MBin = binary:encode_unsigned(M0, big),
+	    M = eme_pckcs1_v1_5_decode(MBin),
+	    em_to_key(M);
+	#{ type := elgamal, p := P, x := X } ->
+	    [C1,C2] = pgp_util:decode_mpi_list(Data,2),
+	    S = mpz:powm(C1, P-1-X, P),  %% C1^-x
+	    M0 = (C2*S) rem P,
+	    MBin = binary:encode_unsigned(M0, big),
+	    M = eme_pckcs1_v1_5_decode(MBin),
+	    em_to_key(M)
+    end.
+    
 key_to_em(Cipher, SessionKey) ->
     CipherAlgorithm = pgp_cipher:encode(Cipher),
     CheckSum = pgp_util:checksum(SessionKey),
     <<CipherAlgorithm, SessionKey/binary, CheckSum:16>>.
+
+em_to_key(<<CipherAlgorithm, Data/binary>>) ->
+    Size = byte_size(Data),
+    <<SessionKey:(Size-2)/binary, CheckSum:16>> = Data,
+    CheckSum = pgp_util:checksum(SessionKey),
+    {pgp_cipher:decode(CipherAlgorithm), SessionKey}.
 
 eme_pckcs1_v1_5_encode(K, M) when byte_size(M) =< K - 11 ->
     MLen = byte_size(M),

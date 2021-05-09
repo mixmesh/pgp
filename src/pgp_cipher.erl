@@ -15,7 +15,8 @@
 -export([adjust_s2k/1]).
 -export([decode_s2k/1]).
 -export([encode_s2k/1]).
-%% 
+-export([cipher_data/3]).
+%% debug
 -export([decode_count/1, encode_count/1]).
 
 %% 9.2.  Symmetric-Key Algorithms
@@ -65,9 +66,13 @@ encrypt(Cipher, S2K, Data, Password) ->
     #{ iv_length := IVLength, block_size := BlockSize } =
 	crypto:cipher_info(Cipher),
     IV = crypto:strong_rand_bytes(IVLength),
+    %% IVZ = <<0:IVLength/unit:8>>, ?
     State = crypto:crypto_init(Cipher,Key,IV,[{encrypt,true}]),
     Data1 = cipher_data(State, BlockSize, Data, []),
     <<IV/binary,Data1/binary>>.
+
+cipher_data(State, BlockSize, Data) ->
+    cipher_data(State, BlockSize, Data, []).
 
 cipher_data(State, _BlockSize, <<>>, Acc) ->
     cipher_final(State, 0, Acc);
