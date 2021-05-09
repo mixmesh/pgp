@@ -312,12 +312,20 @@ encode_packets_([Packet|Packets], Acc, Context) ->
 encode_packets_([], Acc, Context) ->
     {iolist_to_binary(lists:reverse(Acc)), Context}.
 
-encode({public_key_encrypted,#{ keyid := KeyID, value := Data }},Context) ->
-    #{ keymap := KeyMap } = Context,
-    #{ key := Key } = maps:get(KeyID, KeyMap),
+encode({public_key_encrypted,#{ keyid := KeyID, 
+				cipher := Cipher,
+				value := Data }},Context) ->
+    Key = case maps:get(KeyID, Context, undefined) of
+	      undefined ->
+		  Keylookup = maps:get(keylookup, Context),
+		  Keylookup(KeyID);
+	      Key0 ->
+		  Key0
+	  end,
     #{ type := Type } = Key,
     PubKeyAlgorithm = pgp_keys:enc_pubkey_alg(Type,[encrypt]),
-    Encrypted = pubkey_encrypt(Key, Data),
+    %% create password, encrypt that password with public key encryption
+    Encrypted = pubkey_encrypt(Key, Cipher, Data),
     encode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
 		  <<?PUBLIC_KEY_ENCRYPTED_PACKET_VERSION,
 		    KeyID:8/binary,
@@ -998,8 +1006,7 @@ verify_signature_packet(PublicKeyAlg, HashAlg, Hash, Signature,
 		      CryptoAlg, HashAlg, {digest, Hash},
 		      CryptoSignature, Key);
 		_ when SignatureType >= 16#10 andalso SignatureType =< 16#13 ->
-		    #{ issuer := Issuer, key_data := KeyData,
-		       key := CryptoKey } = Context,
+		    #{ issuer := Issuer, key := CryptoKey } = Context,
 		    #{ key_id := KeyID } = CryptoKey,
 		    %% KeyID = pgp_util:key_id(KeyData),
 		    ?dbg("KeyID: ~w, Issuer=~w\n", [KeyID,Issuer]),
@@ -1054,20 +1061,28 @@ signature_level_to_signature_type("2") -> 16#12;
 signature_level_to_signature_type("3") -> 16#13;
 signature_level_to_signature_type(_) -> 0.  %%?
 
-pubkey_encrypt(Key, Data) ->
+pubkey_encrypt(Key, Cipher, SessionKey) ->
     case Key of
 	#{ type := rsa, n := N, e := E } ->
-	    %% (M^E mod N)
-	    <<"nope">>;
-	#{ type := elgamal, p := P, y := Y } ->
-	    <<"nope">>
+	    K = byte_size(binary:encode_unsigned(N, big)),
+	    EM = key_to_em(Cipher, SessionKey),
+	    MBin = eme_pckcs1_v1_5_encode(K, EM),
+	    M = binary:decode_unsigned(MBin, big),
+	    pgp_util:encode_mpi(mpz:powm(M, E, N));
+	#{ type := elgamal, p := P, g := G, y := Y } ->
+	    K = byte_size(binary:encode_unsigned(P, big)),
+	    EM = key_to_em(Cipher, SessionKey),
+	    MBin = eme_pckcs1_v1_5_encode(K, EM),
+	    M = binary:decode_unsigned(MBin, big),
+	    Gk = mpz:powm(G, K, P),
+	    MYk = (M*mpz:powm(Y, K, P)) rem P,
+	    pgp_utl:encode_mpi_list([Gk,MYk])
     end.
 
-key_to_em(Cipher, K, SessionKey) ->
+key_to_em(Cipher, SessionKey) ->
     CipherAlgorithm = pgp_cipher:encode(Cipher),
     CheckSum = pgp_util:checksum(SessionKey),
-    M = <<CipherAlgorithm, SessionKey/binary, CheckSum:16>>,
-    eme_pckcs1_v1_5_encode(K, M).
+    <<CipherAlgorithm, SessionKey/binary, CheckSum:16>>.
 
 eme_pckcs1_v1_5_encode(K, M) when byte_size(M) =< K - 11 ->
     MLen = byte_size(M),
