@@ -27,7 +27,6 @@
 -export([key_id/1]).
 -export([fingerprint_to_key_id/1]).
 
-
 -define(KEY_FIELD_TAG, 16#99).
 
 -define(UNIX_SECONDS, (719528*24*60*60)).
@@ -115,7 +114,6 @@ rand_nonzero_bytes(N) when is_integer(N), N > 0 ->
     end.
 
 -spec sig_data(KeyData::binary()) -> binary().
-
 sig_data(KeyData) ->
     <<?KEY_FIELD_TAG, (byte_size(KeyData)):16, KeyData/binary>>.
 
