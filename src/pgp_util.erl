@@ -26,6 +26,11 @@
 -export([fingerprint/1]).
 -export([key_id/1]).
 -export([fingerprint_to_key_id/1]).
+-export([nbits/1]).
+-export([nbits_byte/1]).
+
+%% debugging aid
+-export([bindiff/2]).
 
 -define(KEY_FIELD_TAG, 16#99).
 
@@ -82,14 +87,39 @@ decode_mpi_bin(<<L:16,Data:((L+7) div 8)/binary,Rest/binary>>, I) ->
     [Data | decode_mpi_bin(Rest, I-1)].
 
 encode_mpi_bin(Bin) when is_binary(Bin) ->
-    L = byte_size(Bin),
-    <<(L*8):16, Bin/binary>>.
+    <<B,_/binary>> = Bin,
+    L = 8*(byte_size(Bin)-1) + nbits_byte(B),
+    <<L:16, Bin/binary>>.
 
 %% is bit size needed? now I assume bytes*8 is ok.
 encode_mpi(X) when is_integer(X) ->
-    Data = binary:encode_unsigned(X, big),
-    L = byte_size(Data),
-    <<(L*8):16, Data/binary>>.
+    <<B,_/binary>> = Data = binary:encode_unsigned(X, big),
+    L = 8*(byte_size(Data)-1) + nbits_byte(B),
+    <<L:16, Data/binary>>.
+
+%%
+nbits(0) -> 1;
+nbits(X) when X > 0, X =< 255 -> nbits_byte(X);
+nbits(X) when X > 0 ->
+    <<B,Bs/binary>> = binary:encode_unsigned(X, big),
+    byte_size(Bs)*8 + nbits_byte(B).
+    
+%% number of bits in a byte
+nbits_byte(X) -> bs(X).
+
+bs(0) -> 0;
+bs(X) when X > 2#1111 -> bs_(X bsr 4, 4);
+bs(X) -> bs_(X, 0).
+	    
+bs_(X,N) when X > 2#11 -> bs__(X bsr 2, N+2);
+bs_(X,N) -> bs__(X, N).
+
+bs__(X,N) when X > 2#1 -> bs___(X bsr 1, N+1);
+bs__(X,N) -> bs___(X, N).
+
+bs___(0, N) -> N;
+bs___(1, N) -> N+1.
+
 
 encode_mpi_list([X]) when is_integer(X) ->
     encode_mpi(X);
@@ -132,4 +162,28 @@ fingerprint_to_key_id(Fingerprint) ->
     <<KeyID:8/binary, _/binary>> = Fingerprint,
     KeyID.
 
-			   
+%% bindiff return a list (max MAXDIFF) positions where two
+%% binaries differ
+-define(MAXDIFF, 10).
+-type diff() :: [{size,integer(),integer()} | {diff,integer(),byte(),byte()}].
+-spec bindiff(Bin1::binary(),Bin2::binary()) -> diff().
+
+bindiff(Bin1, Bin2) ->
+    Bin1Size = byte_size(Bin1),
+    Bin2Size = byte_size(Bin2),
+    if Bin1Size < Bin2Size ->
+	    [{size,Bin1Size,Bin2Size} | bindiff_(Bin1,Bin2,0,?MAXDIFF)];
+       Bin1Size > Bin2Size ->
+	    [{size,Bin1Size,Bin2Size} | bindiff_(Bin2,Bin1,0,?MAXDIFF)];
+       Bin1Size =:= Bin2Size ->
+	    bindiff_(Bin1,Bin2,0,?MAXDIFF)
+    end.
+
+bindiff_(_Bin1,_Bin2,_Offs,0) -> [];
+bindiff_(<<>>,_Bin2,_Offs,_I) -> [];
+bindiff_(<<A,Bin1/binary>>,<<B,Bin2/binary>>,Offs,I) ->
+    if A =:= B ->
+	    bindiff_(Bin1,Bin2,Offs+1,I);	    
+       true ->
+	    [{diff,Offs,A,B}|bindiff_(Bin1,Bin2,Offs+1,I-1)]
+    end.

@@ -96,12 +96,20 @@
 -type public_key() :: rsa_public_key() | dss_public_key() | 
 		      elgamal_public_key().
 
-
 decode_file(Filename) ->
-    {ok,Bin} = file:read_file(Filename),
-    case pgp_armor:decode(Bin) of
-	{ok, _Opts, Data} ->
-	    pgp_parse:decode_stream(Data)
+    decode_file(Filename, #{}).
+
+decode_file(Filename, Context) ->
+    case file:read_file(Filename) of
+	{ok,Bin} ->
+	    case pgp_armor:decode(Bin) of
+		{ok, _Opts, Data} ->
+		    pgp_parse:decode(Data, Context);
+		Error ->
+		    Error
+	    end;
+	Error ->
+	    Error
     end.
 
 encode_file(Filename, Packets) ->
@@ -122,12 +130,11 @@ encode_packets(Packets, Context) ->
 %% Test code to create signed key
 %%
 make_pubkey_packet() ->
-    %% {_Public,Private} = pgp_keys:generate_dss_key(),  %% test key
-    {_Public,Private} = pgp_keys:generate_rsa_key(),  %% test key
-    make_pubkey_packet(Private).
+    {_Public,Secret} = pgp_keys:generate_rsa_key(),  %% test key
+    make_pubkey_packet(Secret).
 
 make_pubkey_packet(SigningKey) ->
-    _SubKey = {Public,_Private} = pgp_keys:generate_mixmesh_key(1024),
+    _SubKey = {Public,_Secret} = pgp_keys:generate_mixmesh_key(1024),
     make_pubkey_packet(SigningKey, Public).
 
 make_pubkey_packet(SigningKey, SubKey) ->

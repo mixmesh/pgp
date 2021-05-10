@@ -22,6 +22,9 @@ test_0() ->
     {Data, _} = pgp_parse:encode(Content, Context),
     pgp_parse:decode(Data, #{  KeyID => Secret }).
 
+test_0_file(ArmoredPublicKeyFile) ->
+    pgp:decode_file(ArmoredPublicKeyFile).
+
 
 test_1() ->
     {Public, Secret} = pgp_keys:generate_rsa_key(),

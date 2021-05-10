@@ -104,12 +104,11 @@
 	#{ type => user_id
 	 }.
 
+%% various fields depending on packet type processed
 -type decoder_ctx() ::
 	#{
-	  state => list(),
-	  %% various fields depending on packet type processed
-	  key => {c14n_key(), pgp:public_key()} | undefined,
-	  subkey => {c14n_key(), pgp:public_key()} | undefined,
+	  key_id => pgp:key_id() | undefined,
+	  subkey_id =>  pgp:key_id() | undefined,
 	  symmeric_key => binary() | undefined,
 	  s2k => s2k_type(),
 	  user_id => user_id() | undefined,
@@ -132,10 +131,8 @@ key_id(KeyData) -> pgp_util:key_id(KeyData).
 
 new_context() ->
     #{ 
-       state => [],
-       %% 
-       key => undefined,
-       subkey => undefined,
+       key_id => undefined,
+       subkey_id => undefined,
        user_id => undefined,
        user_attribute => undefined,
        issuer => undefined,
@@ -147,6 +144,14 @@ new_context() ->
        critical => false
      }.
 
+encode_user_id(UserId) when is_binary(UserId) ->
+    Len = byte_size(UserId),
+    <<?UID_FIELD_TAG,Len:32,UserId/binary>>.
+
+encode_user_attr(UserAttr) when is_binary(UserAttr) ->
+    Len = byte_size(UserAttr),
+    <<?UATTR_FIELD_TAG,Len:32,UserAttr/binary>>.
+
 encode(Packets) ->
     encode(Packets, new_context()).
 encode(Packets, Context) ->
@@ -155,8 +160,7 @@ encode(Packets, Context) ->
 decode(Data) ->
     decode(Data, new_context()).
 decode(Data, Context) ->
-    Context1 = decode_packets(Data, Context),
-    {lists:reverse(maps:get(state, Context1)), Context1}.
+    decode_packets(Data, Context).
 
 encode_packets(Packets, Context) ->
     encode_packets_(Packets, [], Context).
@@ -194,10 +198,11 @@ encode_packet({public_key_encrypted,Param=#{ key_id := KeyID }},Context) ->
 		  KeyID:8/binary,
 		  PubKeyAlgorithm,Encrypted/binary>>, Context1);
 encode_packet({signature, #{ signature_type := SignatureType,
-		      hash_algorithm := HashAlg,
-		      hashed := Hashed,
-		      unhashed := UnHashed }}, Context) ->
-    #{ key := PrivateKey } = Context,
+			     hash_algorithm := HashAlg,
+			     hashed := Hashed,
+			     unhashed := UnHashed }}, Context) ->
+    #{ key_id := KeyID } = Context,
+    PrivateKey = maps:get(KeyID, Context),
     #{ type :=  PublicKeyAlg } = PrivateKey,
     {HashedSubpackets,Context1} = encode_subpackets(Hashed, Context),
     HashedSubpacketsLength = byte_size(HashedSubpackets),
@@ -282,18 +287,22 @@ encode_packet({compressed,Packets}, Context) ->
     Default = [zip,uncompressed],
     Algorithms = maps:get(preferred_compression_algorithms,Context,Default),
     compress_packet(Algorithms, Data ,Context);
-encode_packet({key, #{ key := Key}}, Context) ->
+encode_packet({key, #{ key_id := KeyID } }, Context) ->
+    Key = maps:get(KeyID, Context),
     KeyData = pgp_keys:encode_public_key(Key),
-    pack(?PUBLIC_KEY_PACKET, KeyData, Context#{ key => Key });
-encode_packet({subkey, #{ subkey := Key }}, Context) ->
+    pack(?PUBLIC_KEY_PACKET, KeyData, Context#{ key_id => KeyID });
+encode_packet({subkey, #{ key_id := KeyID }}, Context) ->
+    Key = maps:get(KeyID, Context),
     KeyData = pgp_keys:encode_public_key(Key),
-    pack(?PUBLIC_SUBKEY_PACKET, KeyData, Context#{ subkey => Key  });
-encode_packet({secret_key, #{ key := Key}}, Context) ->
+    pack(?PUBLIC_SUBKEY_PACKET, KeyData, Context#{ subkey_id => KeyID });
+encode_packet({secret_key, #{ key_id := KeyID}}, Context) ->
+    Key = maps:get(KeyID, Context),
     KeyData = pgp_keys:encode_secret_key(Key, Context),
-    pack(?SECRET_KEY_PACKET, KeyData,  Context#{ key => Key });
-encode_packet({secrety_subkey, #{ subkey := Key }}, Context) ->
+    pack(?SECRET_KEY_PACKET, KeyData,  Context#{ key_id => KeyID });
+encode_packet({secrety_subkey, #{ key_id := KeyID }}, Context) ->
+    Key = maps:get(KeyID, Context),
     KeyData = pgp_keys:encode_secret_key(Key, Context),
-    pack(?SECRET_SUBKEY_PACKET, KeyData, Context#{ subkey => Key });
+    pack(?SECRET_SUBKEY_PACKET, KeyData, Context#{ subkey_id => KeyID });
 encode_packet({user_attribute, #{ value := UserAttribute }}, Context) ->
     Len = byte_size(UserAttribute),
     %% encode for signature/hash
@@ -379,22 +388,39 @@ encode_chunked_body(Data, Exp, Acc) when Exp < 32 ->
 %%
 %% Decode packets
 %%
+decode_packets(Data, Context) ->
+    decode_packets_(Data, Context, []).
 
-decode_packets(<<>>, Context) -> Context;
-decode_packets(<<0>>, Context) -> Context;
-decode_packets(<<0,0>>, Context) -> Context;
-decode_packets(<<0,0,0>>, Context) -> Context;
+%% FIXME: handle trailing zeros better (from encypted data without length!)
+decode_packets_(<<>>, Context, Acc) -> {lists:reverse(Acc),Context};
+decode_packets_(<<0>>, Context, Acc) ->  {lists:reverse(Acc),Context};
+decode_packets_(<<0,0>>, Context, Acc) ->  {lists:reverse(Acc),Context};
+decode_packets_(<<0,0,0>>, Context, Acc) -> {lists:reverse(Acc),Context};
 %% Section 4.2.1: Old Format Packet Lengths
-decode_packets(<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data/binary>>,
-               Context) ->
-    {Packet,Data1} =  unpack_old_body(LengthType,Data),
-    NewContext = decode_packet(Tag, Packet, Context),
-    decode_packets(Data1, NewContext);
+decode_packets_(<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data/binary>>,
+		Context, Acc) ->
+    {PacketData,Data1} =  unpack_old_body(LengthType,Data),
+    {Packet,Context1} = decode_packet(Tag, PacketData, Context),
+    Packet1 = extend_packet(Packet, Context1),
+    decode_packets_(Data1, Context1, [Packet1|Acc]);
 %% Section 4.2.2: New Format Packet Lengths
-decode_packets(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>, Context) ->
-    {Packet, Data1} =  unpack_body(Data),
-    NewContext = decode_packet(Tag, Packet, Context),
-    decode_packets(Data1, NewContext).
+decode_packets_(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>, Context, Acc) ->
+    {PacketData, Data1} =  unpack_body(Data),
+    {Packet, Context1} = decode_packet(Tag, PacketData, Context),
+    Packet1 = extend_packet(Packet, Context1),
+    decode_packets_(Data1, Context1, [Packet1|Acc]).
+
+extend_packet(Packet={_Name,_Param},_Context) -> Packet;
+extend_packet({Name,Param,[]},_Context) -> {Name,Param};
+extend_packet({Name,Param,Fields},Context) -> 
+    %% add fields from context into param
+    Param1 = lists:foldl(fun(F,Pi) -> 
+				 Pi#{ F => maps:get(F, Context, undefined) }
+			 end, Param, Fields),
+    {Name, Param1};
+extend_packet(List, _Context) when is_list(List) -> %% packet list
+    List.
+
 
 unpack(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>) ->
     {Packet,Data1} = unpack_body(Data),
@@ -419,13 +445,6 @@ unpack_body_parts(<<2#111:3,Exp:5,Partial:(1 bsl Exp)/binary,Rest/binary>>,Ps) -
 unpack_body_parts(<<Len:8,Packet:Len/binary,Rest/binary>>,Ps) ->
     {iolist_to_binary(lists:reverse([Packet|Ps])),Rest}.
 
-
-%%decode_new_packet(<<2#00:2,Len:6,Packet:Len/binary,Rest/binary>>) ->
-%%    {Packet, Rest};
-%%decode_new_packet(<<2#01:2,Len:6,Packet:(Len+64)/binary,Rest/binary>>) ->
-%%    {Packet, Rest};
-%%decode_new_packet(<<2#10:2,Len:6,Packet:(Len+128)/binary,Rest/binary>>) ->
-%%    {Packet, Rest}.
 
 unpack_old_packet(<<?OLD_PACKET_FORMAT:2,Tag:4,LengthType:2,Data/binary>>) ->
     {Packet,Data1} = unpack_old_body(LengthType, Data),
@@ -462,23 +481,22 @@ decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
 		Data/binary>>,
 	      Context) ->
     SecretKey = case maps:get(KeyID, Context, undefined) of
-		  undefined ->
-		      KeylookupFun = maps:get(keylookup_fun, Context),
-		      KeylookupFun(KeyID, secret, Context);
-		  Key0 ->
-		      Key0
-	      end,
+		    undefined ->
+			KeyFindFun = maps:get(keyfind_fun, Context),
+			KeyFindFun(KeyID, secret, Context);
+		    Key0 ->
+			Key0
+		end,
     #{ type := Type } = SecretKey,
     {Type,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
     {Cipher, SymmetricKey} = pubkey_decrypt(SecretKey, Data),
-    callback(public_key_encrypted, 
-	     #{ algorithm => Type,
-		symmetric_key => SymmetricKey,
-		cipher => Cipher,
-		use => Use,  %% check encrypt?
-		keyid => KeyID },
-	     Context#{ symmetric_key => SymmetricKey,
-		       cipher => Cipher });
+    {{public_key_encrypted, #{ algorithm => Type,
+			       symmetric_key => SymmetricKey,
+			       cipher => Cipher,
+			       use => Use,  %% check encrypt?
+			       key_id => KeyID }},
+     Context#{ symmetric_key => SymmetricKey,
+	       cipher => Cipher }};
 
 %% Section 5.2: Signature Packet (Tag 2)
 decode_packet(?SIGNATURE_PACKET,
@@ -491,12 +509,12 @@ decode_packet(?SIGNATURE_PACKET,
                 UnHashedSubpacketsLength:16,
                 UnHashedSubpackets:UnHashedSubpacketsLength/binary,
                 SignedHashLeft16:2/binary,
-                Signature/binary>> = SignatureData,
+                Signature/binary>>,
               Context) ->
     HashAlg = pgp_hash:decode(HashAlgorithm),
     {PublicKeyAlg,_Use} = pgp_keys:dec_pubkey_alg(PublicKeyAlgorithm),
     Expected =
-        case maps:get(skip_signature_check, Context) of
+        case maps:get(skip_signature_check, Context, false) of
             true ->
                 <<SignedHashLeft16:2/binary>>;
             false ->
@@ -512,41 +530,31 @@ decode_packet(?SIGNATURE_PACKET,
     %% Crash?
     <<SignedHashLeft16:2/binary, _/binary>> = Expected,
 
-    Context1 = callback(push, #{}, Context),
-    Context2 = decode_subpackets(HashedSubpackets, Context1),
-    Context3 = callback(pop, #{}, Context2), 
-    Context4 = callback(push, #{}, Context3),
-    Context5 = decode_subpackets(UnHashedSubpackets, Context4),
-    Context6 = callback(pop, #{}, Context5),
+    {Hashed,Context1} = decode_subpackets(HashedSubpackets, Context),
+    {UnHashed,Context2} = decode_subpackets(UnHashedSubpackets, Context1),
 
-    %% callback signature fail / success?
     Verified =
 	verify_signature_packet(
 	  PublicKeyAlg, HashAlg, Expected, Signature, SignatureType,
-	  Context6),
+	  Context2),
 
     SignatureLevel = signature_type_to_signature_level(SignatureType),
-    {UnHashed,Context7} = pop(Context6),
-    {Hashed,Context8} = pop(Context7),
 
-    callback(signature,
-	     #{
-	       verified => Verified,
-	       signature_type => SignatureType,
-	       public_key_algorithm => PublicKeyAlg,
-	       hash_algorithm => HashAlg,
-	       signature => Signature,
-	       signature_data => SignatureData,
-	       signature_level => SignatureLevel,
-	       hashed => Hashed,
-	       unhashed => UnHashed
-	      },
-	     [signature_expiration_time,
-	      signature_creation_time,
-	      policy_uri,
-	      issuer,
-	      key_expiration],
-	     Context8);
+    {{signature, #{ verified => Verified,
+		    signature => Signature,
+		    signature_type => SignatureType,
+		    signature_level => SignatureLevel,
+		    public_key_algorithm => PublicKeyAlg,
+		    hash_algorithm => HashAlg,
+		    hashed => Hashed,
+		    unhashed => UnHashed
+		  },
+      [signature_expiration_time,
+       signature_creation_time,
+       policy_uri,
+       issuer,
+       key_expiration]},
+     Context2};
 
 decode_packet(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
 	      <<?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET_VERSION,
@@ -578,9 +586,8 @@ decode_packet(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
 			error(decryption_failed)
 		end
 	end,
-    callback(symmetric_key_encrypted_session_key,
-	     #{ value => SymmetricKey }, [],
-	     Context# { symmetric_key => SymmetricKey, cipher => Cipher });
+    {{symmetric_key_encrypted_session_key, #{ value => SymmetricKey }},
+     Context#{ symmetric_key => SymmetricKey, cipher => Cipher }};
 	      
 %% Section 5.5.1.1: Public-Key Packet (Tag 6)
 %% Section 5.5.1.2: Public-Subkey Packet (Tag 14)
@@ -602,24 +609,18 @@ decode_packet(?SECRET_SUBKEY_PACKET,
 
 %% Section 5.13: User Attribute Packet (Tag 17)
 decode_packet(?USER_ATTRIBUTE_PACKET, UserAttribute, Context) ->
-    Len = byte_size(UserAttribute),
-    Value = <<?UATTR_FIELD_TAG,Len:32,UserAttribute/binary>>,
-    callback(user_attribute, #{ value => UserAttribute },
-	     [user_id],
-	     Context# { user_attribute => Value });
+    {{user_attribute, #{ value => UserAttribute }}, [user_id],
+     Context# { user_attribute => UserAttribute }};
 %% Section 5.12: User ID Packet (Tag 13)
 decode_packet(?USER_ID_PACKET, UserId, Context) ->
-    Len = byte_size(UserId),
-    UID = <<?UID_FIELD_TAG,Len:32,UserId/binary>>,
-    callback(user_id, #{ value => UserId },
-	     Context#{ user_id => UID,
-		       user_attribute => undefined });
+    {{user_id, #{ value => UserId }}, 
+     Context#{ user_id => UserId,  user_attribute => undefined }};
 decode_packet(?COMPRESSED_PACKET, <<Algorithm,Data/binary>>, Context) ->
     Data1 = pgp_compress:decompress(Algorithm,Data),
     decode_packets(Data1, Context);
 decode_packet(?LITERAL_DATA_PACKET, <<Format,Data/binary>>, Context) ->
     %% convert format=$t line-endings?
-    callback(literal_data, #{ format => Format, value => Data }, Context);
+    {{literal_data, #{ format => Format, value => Data }}, Context};
 decode_packet(?ENCRYPTED_PACKET, Data, Context) ->
     #{ cipher := Cipher, symmetric_key := SymmetricKey } = Context,
     #{ iv_length := IVLength, block_size := BlockSize } =
@@ -633,30 +634,37 @@ decode_packet(?ENCRYPTED_PACKET, Data, Context) ->
 decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
     %% FIXME: decrypt if secret key is available and packet is valid
     %% then recursive decrypt 
-    callback(encrypted_protected, #{ version => Version,
-				     value => Data }, Context).
+    {{encrypted_protected, #{ version => Version,value => Data }},
+     Context}.
 
 %% version 4
 decode_public_key_4(key, KeyData, Context) ->
     Key = pgp_keys:decode_public_key(KeyData),
     #{ key_id := KeyID } = Key,
-    callback(key, #{ key => Key }, Context#{ key => Key, KeyID => Key });
-decode_public_key_4(subkey, KeyData, Context = #{ key := PrimaryKey }) ->
-    Key = pgp_keys:decode_public_key(KeyData),
-    #{ key_id := KeyID } = Key,
-    callback(subkey, #{ subkey => Key, key => PrimaryKey },
-	     [user_id], Context#{ subkey => Key, KeyID => Key  }).
+    {{key, #{ key_id => KeyID }}, 
+     Context#{ key_id => KeyID, KeyID => Key, key_data => KeyData }};
+
+decode_public_key_4(subkey, KeyData, Context = #{ key_id := KeyID }) ->
+    SubKey = pgp_keys:decode_public_key(KeyData),
+    #{ key_id := SubKeyID } = SubKey,
+    {{subkey, #{ key_id => SubKeyID, 
+		 primary_key_id => KeyID }, [user_id]},
+     Context#{ subkey_id => SubKeyID, SubKeyID => SubKey, 
+	       subkey_data => KeyData }}.
 
 %% version 4
 decode_secret_key_4(secret_key, KeyData, Context) ->
     Key = pgp_keys:decode_secret_key(KeyData),
-    #{ key_id := KeyID } = Key, %% not needed ! remove this soon
-    callback(secret_key, #{ key => Key }, Context#{ key => Key, KeyID => Key });
-decode_secret_key_4(secret_subkey,KeyData, Context = #{ key := PrimaryKey }) ->
-    Key = pgp_keys:decode_secret_key(KeyData),
-    #{ key_id := KeyID } = Key,  %% not needed ! remove this soon
-    callback(secret_subkey, #{ subkey => Key, key => PrimaryKey },
-	     [user_id], Context#{ subkey => Key, KeyID => Key  }).
+    #{ key_id := KeyID } = Key,
+    {{secret_key, #{ key_id => KeyID }},
+     Context#{ key_id => KeyID, KeyID => Key }};
+decode_secret_key_4(secret_subkey,KeyData, 
+		    Context = #{ key := KeyID }) ->
+    SubKey = pgp_keys:decode_secret_key(KeyData),
+    #{ key_id := SubKeyID } = SubKey,
+    {{secret_subkey, #{ key_id => SubKeyID, primary_key_id => KeyID },
+      [user_id]},
+     Context#{ subkey_id => SubKeyID, SubKeyID => SubKey  }}.
 
 %%
 %% Signature packet handling
@@ -670,9 +678,24 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
             %% 0x18: Subkey Binding Signature
             %% 0x19: Primary Key Binding Signature
             KeyBinding when KeyBinding =:= 16#18 orelse KeyBinding =:= 16#19 ->
-		#{ key := Key, subkey := SubKey } = Context,
+		#{ key_id := KeyID, subkey_id := SubKeyID } = Context,
+		%% #{ key_data := KeyData0, subkey_data := SubKeyData0 } = Context,
+		Key = maps:get(KeyID, Context),
 		KeyData = pgp_keys:encode_public_key(Key),
+
+		%% if KeyData =/= KeyData0 ->
+		%% 	io:format("KeyData[~w]\n~p\n",
+		%% 		  [byte_size(KeyData),KeyData]),
+		%% 	io:format("KeyData0[~w]\n~p\n",
+		%% 		  [byte_size(KeyData0),KeyData0]),
+		%% 	io:format("Diff = ~w\n",
+		%% 		  [pgp_util:bindiff(KeyData, KeyData0)]);
+		%%    true ->
+		%% 	ok
+		%% end,
+
 		SigKeyData = pgp_util:sig_data(KeyData),
+		SubKey = maps:get(SubKeyID, Context),
 		SubKeyData = pgp_keys:encode_public_key(SubKey),
 		SigSubKeyData = pgp_util:sig_data(SubKeyData),
                 crypto:hash_update(
@@ -685,18 +708,32 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
             Certification when (Certification >= 16#10 andalso
                                 Certification =< 16#13) orelse
                                Certification == 16#30 ->
-		#{ key := Key, user_id := UID } = Context,
+		#{ key_id := KeyID, user_id := UserId } = Context,
+		#{ key_data := KeyData0 } = Context,
+		Key = maps:get(KeyID, Context),
 		KeyData = pgp_keys:encode_public_key(Key),
+
+		if KeyData =/= KeyData0 ->
+			io:format("KeyData[~w]\n~p\n",
+				  [byte_size(KeyData),KeyData]),
+			io:format("KeyData0[~w]\n~p\n",
+				  [byte_size(KeyData0),KeyData0]),
+			io:format("Diff = ~w\n",
+				  [pgp_util:bindiff(KeyData, KeyData0)]);
+		   true ->
+			ok
+		end,
+
 		SigKeyData = pgp_util:sig_data(KeyData),
-                UserId =
+                UID =
 		    case maps:get(user_attribute, Context, undefined) of
 			undefined ->
-                            UID;
-			UATTR ->
-                            UATTR
+			    encode_user_id(UserId);
+			UserAttr ->
+			    encode_user_attr(UserAttr)
                     end,
                 crypto:hash_update(
-                  crypto:hash_update(HashState, SigKeyData), UserId);
+                  crypto:hash_update(HashState, SigKeyData), UID);
             _ ->
                 ?err("unknown_signature_type: ~p\n",[SignatureType]),
                 HashState
@@ -720,89 +757,92 @@ decode_param(Param, #{ critical := true }) ->
 decode_param(Param, _Context) ->
     Param.
 
-decode_subpackets(<<>>, Context) ->
-    Context;
-decode_subpackets(Packets, Context) ->
-    {Payload, Rest} = unpack_body(Packets),
-    NewContext = decode_subpacket(Payload, Context),
-    decode_subpackets(Rest, NewContext#{critical => false}).
+decode_subpackets(Data, Context) ->
+    decode_subpackets_(Data, Context, []).
+
+decode_subpackets_(<<>>, Context, Acc) ->
+    {lists:reverse(Acc), Context};
+decode_subpackets_(Data, Context, Acc) ->
+    {Payload, Data1} = unpack_body(Data),
+    %% we could check critical packets here!
+    {Sub, Context1} = decode_subpacket(Payload, Context),
+    decode_subpackets_(Data1, Context1#{critical => false}, [Sub|Acc]).
 
 %% 5.2.3.4.  Signature Creation Time
 decode_subpacket(<<?SIGNATURE_CREATION_TIME_SUBPACKET, Timestamp:32>>,
                         Context) ->
     DateTime = pgp_util:timestamp_to_datetime(Timestamp),
-    Param = decode_param(#{ value => DateTime },
-			 Context),
-    callback(signature_creation_time, Param,
-	     Context#{signature_creation_time => Timestamp});
+    Param = decode_param(#{ value => DateTime }, Context),
+    {{signature_creation_time, Param},
+     Context#{signature_creation_time => Timestamp}};
 %% 5.2.3.5.  Issuer
 decode_subpacket(<<?ISSUER_SUBPACKET, Issuer:8/binary>>, Context) ->
     Param = decode_param(#{ value => Issuer }, Context),
-    callback(issuer, Param, Context#{ issuer => Issuer});
+    {{issuer, Param}, Context#{ issuer => Issuer}};
 
 %% 5.2.3.5.  Key Expiration TIme
 decode_subpacket(<<?KEY_EXPIRATION_SUBPACKET, Timestamp:32>>, Context) ->
     DateTime = pgp_util:timestamp_to_datetime(Timestamp),
     Param = decode_param(#{ value => DateTime }, Context),
-    callback(key_expiration, Param, Context#{key_expiration => Timestamp});
+    {{key_expiration, Param}, Context#{key_expiration => Timestamp}};
 
 %% 5.2.3.7.  Preferred Symmetric Algorithms
 decode_subpacket(<<?PREFERRED_SYMMETRIC_ALGORITHMS, Data/binary>>,
 			Context) ->
     Value = [pgp_cipher:decode(V) || <<V>> <= Data ],
     Param = decode_param(#{ value => Value }, Context),
-    callback(preferred_symmetric_algorithms, Param, Context);
+    {{preferred_symmetric_algorithms, Param}, Context};
 
 %% 5.2.3.8.  Preferred Hash Algorithms
 decode_subpacket(<<?PREFERRED_HASH_ALGORITHMS, Data/binary>>,
 			Context) ->
     Value = [pgp_hash:decode(V) || <<V>> <= Data ],
     Param = decode_param(#{ value => Value }, Context),
-    callback(preferred_hash_algorithms, Param, Context);
+    {{preferred_hash_algorithms, Param}, Context};
 
 %% 5.2.3.9.  Preferred Compression Algorithms
 decode_subpacket(<<?PREFERRED_COMPRESSION_ALGORITHMS, Data/binary>>,
 		 Context) ->
     Value = [pgp_compress:decode(V) || <<V>> <= Data ],
     Param = decode_param(#{ value => Value },Context),
-    callback(preferred_compression_algorithms, Param,Context);
+    {{preferred_compression_algorithms, Param},Context};
 
 %% 5.2.3.10.  Key Expiration Time
 decode_subpacket(<<?SIGNATURE_EXPIRATION_TIME_SUBPACKET, Timestamp:32>>,
                         Context) ->
     Param = decode_param(#{ value => Timestamp }, Context),
     %% relative to creation_time! unless Timestamp = 0 => never
-    callback(signature_expiration_time, Param,
-	     Context#{signature_expiration_time => Timestamp});
+    {{signature_expiration_time, Param},
+     Context#{signature_expiration_time => Timestamp}};
 
 %% 5.2.3.17.  Key Server Preferences
 decode_subpacket(<<?KEY_SERVER_PREFERENCES, Flags/binary>>, Context) ->
     Param = decode_param(#{ value => Flags }, Context),
-    callback(key_server_preferences, Param, 
-	     Context#{ key_server_preferences => Flags });
+    {{key_server_preferences, Param}, 
+     Context#{ key_server_preferences => Flags }};
 %% 5.2.3.18.  Preferred Key Server
 decode_subpacket(<<?PREFERRED_KEY_SERVER, Server/binary>>, Context) ->
     Param = decode_param(#{ value => Server }, Context),
-    callback(prefered_key_server, Param, Context);
+    {{prefered_key_server, Param}, Context};
 %% 5.2.3.19.  Primary User ID
 decode_subpacket(<<?PRIMARY_USER_ID, Flag>>, Context) ->
     Param = decode_param(#{ value => Flag }, Context),
-    callback(primary_user_id, Param, Context);
+    {{primary_user_id, Param}, Context};
 %% 5.2.3.20.  Policy URI
 decode_subpacket(<<?POLICY_URI_SUBPACKET, Uri/binary>>, Context) ->
     Param = decode_param(#{ value => Uri }, Context),
-    callback(policy_uri, Param, Context#{ policy_uri => Uri });
+    {{policy_uri, Param}, Context#{ policy_uri => Uri }};
 %% 5.2.3.21.  Key Flags
 decode_subpacket(<<?KEY_FLAGS, Flags/binary>>, Context) ->
     Param = decode_param(#{ value => Flags }, Context),
-    callback(key_flags, Param,  Context#{ key_flags => Flags });
+    {{key_flags, Param},  Context#{ key_flags => Flags }};
 decode_subpacket(<<?FEATURES, Flags/binary>>, Context) ->
     Param = decode_param(#{ value => Flags }, Context),
-    callback(features, Param, Context);
+    {{features, Param}, Context};
 %% 5.2.3.28.  Issuer Fingerprint
 decode_subpacket(<<?ISSUER_FINGERPRINT,V,Finger/binary>>, Context) ->
     Param = decode_param(#{ version => V,value => Finger }, Context),
-    callback(issuer_fingerprint, Param, Context);
+    {{issuer_fingerprint, Param}, Context};
 
 decode_subpacket(<<Tag, Rest/binary>>, Context)
   when Tag band 128 =:= 128 ->
@@ -811,7 +851,8 @@ decode_subpacket(<<Tag, Rest/binary>>, Context)
 decode_subpacket(<<_Tag, _/binary>>, Context = #{critical := false}) ->
     ?dbg("decode_signed_subpacket: ignore tag = ~w - not handled\n", 
 	 [_Tag]),
-    Context.
+    {ignore, Context}.
+
 
 encode_subpackets(Packets, Context) ->
     encode_subpackets_(Packets, [], Context).
@@ -828,133 +869,96 @@ encode_subpackets_([], Acc, Context) ->
 encode_subpacket({signature_creation_time,Param=#{ value := DateTime }},
 		 Context) ->
     Timestamp = pgp_util:datetime_to_timestamp(DateTime),
-    encode_sub(?SIGNATURE_CREATION_TIME_SUBPACKET,<<Timestamp:32>>,
+    pack_sub(?SIGNATURE_CREATION_TIME_SUBPACKET,<<Timestamp:32>>,
 	       Param, Context);
 %% 5.2.3.5.  Issuer
 
 encode_subpacket({issuer,self}, Context) ->
-    #{ key := Key } = Context,
-    #{ key_id := Issuer } = Key,
-    encode_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,#{},Context);
+    #{ key_id := Issuer } = Context,
+    pack_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,#{},Context);
 encode_subpacket({issuer,primary}, Context) ->
-    #{ key := Key } = Context,
-    #{ key_id := Issuer } = Key,    
-    encode_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,#{},Context);
+    #{ key_id := Issuer } = Context,
+    pack_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,#{},Context);
 encode_subpacket({issuer,Param=#{ value := Issuer }}, Context) ->
-    encode_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,Param,Context);
+    pack_sub(?ISSUER_SUBPACKET,<<Issuer:8/binary>>,Param,Context);
 
 %% 5.2.3.5.  Key Expiration TIme
 encode_subpacket({key_expiration,Param=#{ value := DateTime}},Context) ->
     Timestamp = pgp_util:timestamp_to_datetime(DateTime),
-    encode_sub(?KEY_EXPIRATION_SUBPACKET,<<Timestamp:32>>,Param,Context);
+    pack_sub(?KEY_EXPIRATION_SUBPACKET,<<Timestamp:32>>,Param,Context);
 
 %% 5.2.3.7.  Preferred Symmetric Algorithms
 encode_subpacket({preferred_symmetric_algorithms,Param=#{ value := Value }},
 		 Context)->
     Data = << <<(pgp_cipher:encode(V))>> || V <- Value >>,
-    encode_sub(?PREFERRED_SYMMETRIC_ALGORITHMS,<<Data/binary>>,Param,Context);
+    pack_sub(?PREFERRED_SYMMETRIC_ALGORITHMS,<<Data/binary>>,Param,Context);
 
 %% 5.2.3.8.  Preferred Hash Algorithms
 encode_subpacket({preferred_hash_algorithms,Param=#{ value := Value }},
 		 Context) ->
     Data = << <<(pgp_hash:encode(V))>> || V <- Value >>,
-    encode_sub(?PREFERRED_HASH_ALGORITHMS,<<Data/binary>>,Param,Context);
+    pack_sub(?PREFERRED_HASH_ALGORITHMS,<<Data/binary>>,Param,Context);
 
 %% 5.2.3.9.  Preferred Compression Algorithms
 encode_subpacket({preferred_compression_algorithms,Param=#{ value := Value }},
 		 Context) ->
     Data = << <<(pgp_compress:encode(V))>> || V <- Value >>,
-    encode_sub(?PREFERRED_COMPRESSION_ALGORITHMS,<<Data/binary>>,Param,Context);
+    pack_sub(?PREFERRED_COMPRESSION_ALGORITHMS,<<Data/binary>>,Param,Context);
 
 %% 5.2.3.10.  Key Expiration Time
 encode_subpacket({signature_expiration_time,Param=#{ value := DateTime}},
 		 Context) ->
     Timestamp = pgp_util:timestamp_to_datetime(DateTime),
-    encode_sub(?SIGNATURE_EXPIRATION_TIME_SUBPACKET,<<Timestamp:32>>,Param,
+    pack_sub(?SIGNATURE_EXPIRATION_TIME_SUBPACKET,<<Timestamp:32>>,Param,
 	       Context);
 
 %% 5.2.3.17.  Key Server Preferences
 encode_subpacket({key_server_preferences,Param=#{ value := Flags }},Context) ->
-    encode_sub(?KEY_SERVER_PREFERENCES,<<Flags/binary>>,Param,Context);
+    pack_sub(?KEY_SERVER_PREFERENCES,<<Flags/binary>>,Param,Context);
 
 %% 5.2.3.18.  Preferred Key Server
 encode_subpacket({prefered_key_server,Param=#{ value := Server }},Context) ->
-    encode_sub(?PREFERRED_KEY_SERVER,<<Server/binary>>,Param,Context);
+    pack_sub(?PREFERRED_KEY_SERVER,<<Server/binary>>,Param,Context);
 
 %% 5.2.3.19.  Primary User ID
 encode_subpacket({primary_user_id,Param=#{ value := Flag }},Context) ->
-    encode_sub(?PRIMARY_USER_ID,<<Flag>>,Param,Context);
+    pack_sub(?PRIMARY_USER_ID,<<Flag>>,Param,Context);
 
 %% 5.2.3.20.  Policy URI
 encode_subpacket({policy_uri,Param=#{ value := Uri }},Context) ->
-    encode_sub(?POLICY_URI_SUBPACKET,<<Uri/binary>>,Param,Context);
+    pack_sub(?POLICY_URI_SUBPACKET,<<Uri/binary>>,Param,Context);
 
 %% 5.2.3.21.  Key Flags
 encode_subpacket({key_flags,Param=#{ value := Flags }},Context) ->
-    encode_sub(?KEY_FLAGS,<<Flags/binary>>,Param,Context);
+    pack_sub(?KEY_FLAGS,<<Flags/binary>>,Param,Context);
 
 encode_subpacket({features,Param=#{ value := Flags }},Context) ->
-    encode_sub(?FEATURES,<<Flags/binary>>,Param,Context);
+    pack_sub(?FEATURES,<<Flags/binary>>,Param,Context);
 
 %% 5.2.3.28.  Issuer Fingerprint
 encode_subpacket({issuer_fingerprint,self}, Context) ->
-    #{ key := Key } = Context,
+    #{ key_id := KeyID } = Context,
+    Key = maps:get(KeyID, Context),
     #{ fingerprint := Fingerprint } = Key,
     Version = ?KEY_PACKET_VERSION,
-    encode_sub(?ISSUER_FINGERPRINT,<<Version,Fingerprint/binary>>,#{},Context);
+    pack_sub(?ISSUER_FINGERPRINT,<<Version,Fingerprint/binary>>,#{},Context);
 encode_subpacket({issuer_fingerprint,primary}, Context) ->
-    #{ key := Key } = Context,
+    #{ key_id := KeyID } = Context,
+    Key = maps:get(KeyID, Context),
     #{ fingerprint := Fingerprint } = Key,
     Version = ?KEY_PACKET_VERSION,
-    encode_sub(?ISSUER_FINGERPRINT,<<Version,Fingerprint/binary>>,#{},Context);
+    pack_sub(?ISSUER_FINGERPRINT,<<Version,Fingerprint/binary>>,#{},Context);
 encode_subpacket({issuer_fingerprint,
 		  Param=#{ version := V,value := Finger }},
 		 Context) ->
-    encode_sub(?ISSUER_FINGERPRINT,<<V,Finger/binary>>,Param,Context).
+    pack_sub(?ISSUER_FINGERPRINT,<<V,Finger/binary>>,Param,Context).
 
-encode_sub(Tag, Data, Param, Context) ->
+pack_sub(Tag, Data, Param, Context) ->
     Tag1 = case Param of
 	       #{ critical := true } -> Tag + 16#80;
 	       _ -> Tag
 	   end,
     {<<Tag1,Data/binary>>, Context}.
-
-
-default_handler(push, _Params, Stack) ->
-    [mark | Stack];
-default_handler(pop, _Params, Stack) ->
-    {Elems,Stack1} = collect_until_mark(Stack,[]),
-    [Elems|Stack1];
-default_handler(PacketType, Params, Stack) ->
-    [{PacketType,Params} | Stack].
-
-%% Assume state is a list
-pop(Context = #{ state := [Head|Tail] }) ->
-    {Head, Context#{ state => Tail }};
-pop(Context = #{ state := [] }) ->
-    {[], Context#{ state => [] }}.
-
-collect_until_mark([mark|Stack],Acc) ->
-    {Acc, Stack};
-collect_until_mark([Elem|Stack],Acc) ->
-    collect_until_mark(Stack,[Elem|Acc]);
-collect_until_mark([],Acc) -> %% warning? error?
-    {Acc,[]}.
-    
-callback(Type, Params, Context) ->
-    callback(Type, Params, [], Context).
-callback(Type, Params, Fields, Context) ->
-    State = maps:get(state, Context, []),
-    Params1 =
-	if Fields =:= [] -> Params;
-	   true ->
-		lists:foldl(fun(F,Pi) -> 
-				    Pi#{ F => maps:get(F, Context, undefined) }
-			    end, Params, Fields)
-	end,
-    ?dbg("handle ~w, ~100p\n", [Type, Params1]),
-    State1 = default_handler(Type, Params1, State),
-    Context#{ state => State1 }.
 
 %% check signature
 %% return 
@@ -974,16 +978,16 @@ verify_signature_packet(PublicKeyAlg, HashAlg, Hash, Signature,
 	{ok,CryptoSignature} ->
 	    case SignatureType of
 		16#18 ->
-		    #{ key := CryptoKey} = Context,
+		    #{ key_id := KeyID } = Context,
+		    CryptoKey = maps:get(KeyID, Context),
 		    #{ type := CryptoAlg } = CryptoKey,
 		    Key = pgp_keys:public_params(CryptoKey),
 		    crypto:verify(
 		      CryptoAlg, HashAlg, {digest, Hash},
 		      CryptoSignature, Key);
 		_ when SignatureType >= 16#10 andalso SignatureType =< 16#13 ->
-		    #{ issuer := Issuer, key := CryptoKey } = Context,
-		    #{ key_id := KeyID } = CryptoKey,
-		    %% KeyID = pgp_util:key_id(KeyData),
+		    #{ issuer := Issuer, key_id := KeyID } = Context,
+		    CryptoKey = maps:get(KeyID, Context),
 		    ?dbg("KeyID: ~w, Issuer=~w\n", [KeyID,Issuer]),
 		    case prefix(KeyID, Issuer) of
 			true ->
