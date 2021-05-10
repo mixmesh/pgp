@@ -16,8 +16,8 @@
 -include("OpenSSL.hrl").
 
 -define(err(F,A), io:format((F),(A))).
-%%-define(dbg(F,A), io:format((F),(A))).
--define(dbg(F,A), ok).
+-define(dbg(F,A), io:format((F),(A))).
+%%-define(dbg(F,A), ok).
 -compile(export_all).
 
 %% Section references can be found in
