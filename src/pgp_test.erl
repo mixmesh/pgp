@@ -23,10 +23,6 @@ test_0() ->
     {Data, _} = pgp_parse:encode(Content, Context),
     pgp_parse:decode(Data, #{  KeyID => Secret }).
 
-test_0_file(ArmoredPublicKeyFile) ->
-    pgp:decode_file(ArmoredPublicKeyFile).
-
-
 test_1() ->
     {Public, Secret} = pgp_keys:generate_rsa_key(),
     #{ key_id := KeyID } =  Public,
@@ -43,6 +39,22 @@ test_1() ->
     {Data, _} = pgp_parse:encode(Content, Context),
     pgp_parse:decode(Data, #{  KeyID => Secret }).
 
+test_1_file(ArmoredPublicKeyFile) ->
+    {Packets,Context} = pgp:decode_file(ArmoredPublicKeyFile),
+    {key,#{key_id:=KeyID}} = lists:keyfind(key, 1, Packets),
+    {subkey,#{key_id:=SubKeyID}} = lists:keyfind(subkey, 1, Packets),
+    Content =
+	[
+	 {public_key_encrypted_session_key, #{ key_id => KeyID,
+					       subkey_id => SubKeyID }},
+	 {encrypted,
+	  [
+	   {literal_data,#{ format => $t, value => "Hello" }},
+	   {literal_data,#{ format => $t, value => ", World!" }}
+	  ]}
+	],
+    {Data, _} = pgp_parse:encode(Content, Context),    
+    pgp_armor:encode_message(Data).    
 
 test_2() ->
     Content =
@@ -112,9 +124,3 @@ test_packets() ->
 	      Old = pgp_parse:pack_old_packet(13, Packet),
 	      {{13,Packet},<<>>} = pgp_parse:unpack_old_packet(Old)
       end, lists:seq(1, 1000)++[65535,70000,1000000]).
-
-
-		      
-     
-     
-    

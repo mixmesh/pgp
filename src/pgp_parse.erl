@@ -97,7 +97,8 @@
 	   use => pgp:key_use(),
 	   symmetric_key => binary(),
 	   cipher => pgp_cipher:cipher(),
-	   key_id => pgp:key_id()
+	   key_id => pgp:key_id(),
+	   subkey_id => pgp:key_id()
 	 }.
 
 -type signature_param() :: 
@@ -212,10 +213,12 @@ encode_packets_([Packet|Packets], Acc, Context) ->
 encode_packets_([], Acc, Context) ->
     {iolist_to_binary(lists:reverse(Acc)), Context}.
 
-encode_packet({public_key_encrypted_session_key,Param=#{ key_id := KeyID }},
+encode_packet({public_key_encrypted_session_key,
+	       Param=#{ key_id := KeyID }},
 	      Context) ->
+    EKeyID = maps:get(subkey_id, Param, KeyID),
     Cipher = maps:get(cipher, Param, des_ede3_cbc),
-    Key = case maps:get(KeyID, Context, undefined) of
+    Key = case maps:get(EKeyID, Context, undefined) of
 	      undefined ->
 		  KeylookupFun = maps:get(keylookup_fun, Context),
 		  KeylookupFun(KeyID, Context);
@@ -690,13 +693,13 @@ decode_public_key_4(subkey, KeyData, Context = #{ key_id := KeyID }) ->
 
 %% version 4
 decode_secret_key_4(secret_key, KeyData, Context) ->
-    Key = pgp_keys:decode_secret_key(KeyData),
+    Key = pgp_keys:decode_secret_key(KeyData, Context),
     #{ key_id := KeyID } = Key,
     {{secret_key, #{ key_id => KeyID }},
      Context#{ key_id => KeyID, KeyID => Key }};
 decode_secret_key_4(secret_subkey,KeyData, 
 		    Context = #{ key := KeyID }) ->
-    SubKey = pgp_keys:decode_secret_key(KeyData),
+    SubKey = pgp_keys:decode_secret_key(KeyData, Context),
     #{ key_id := SubKeyID } = SubKey,
     {{secret_subkey, #{ key_id => SubKeyID, primary_key_id => KeyID },
       [user_id]},

@@ -20,8 +20,8 @@
 -export([public_params/1, private_params/1]).
 
 %% -compile(export_all).
-%% -define(dbg(F,A), io:format((F),(A))).
--define(dbg(F,A), ok).
+-define(dbg(F,A), io:format((F),(A))).
+%%-define(dbg(F,A), ok).
 
 -define(KEY_PACKET_VERSION, 4).
 

@@ -55,21 +55,20 @@ decrypt(plaintext, _S2K, Data, _Password) -> %% dissallow?
     Data;
 decrypt(Cipher, S2K, Data, Password) ->
     Key = string_to_key(S2K, Cipher, Password),
-    #{ iv_length := IVLength, block_size := BlockSize } = 
-	crypto:cipher_info(Cipher),
-    <<IV:IVLength/binary, Data1/binary>> = Data,
-    State = crypto:crypto_init(Cipher,Key,IV,[{encrypt,false}]),
-    cipher_data(State, BlockSize, Data1, []).
+    #{ block_size := BlockSize } = crypto:cipher_info(Cipher),
+    IVZ = <<0:BlockSize/unit:8>>,
+    State = crypto:crypto_init(Cipher,Key,IVZ,[{encrypt,false}]),
+    <<_:BlockSize/binary,Data1/binary>> =
+	cipher_data(State, BlockSize, Data, []),
+    Data1.
 
 encrypt(Cipher, S2K, Data, Password) ->
     Key = string_to_key(S2K, Cipher, Password),
-    #{ iv_length := IVLength, block_size := BlockSize } =
-	crypto:cipher_info(Cipher),
-    IV = crypto:strong_rand_bytes(IVLength),
-    %% IVZ = <<0:IVLength/unit:8>>, ?
-    State = crypto:crypto_init(Cipher,Key,IV,[{encrypt,true}]),
-    Data1 = cipher_data(State, BlockSize, Data, []),
-    <<IV/binary,Data1/binary>>.
+    #{ block_size := BlockSize } = crypto:cipher_info(Cipher),
+    IV = crypto:strong_rand_bytes(BlockSize),
+    IVZ = <<0:BlockSize/unit:8>>,
+    State = crypto:crypto_init(Cipher,Key,IVZ,[{encrypt,true}]),
+    cipher_data(State, BlockSize, <<IV/binary,Data/binary>>, []).
 
 cipher_data(State, BlockSize, Data) ->
     cipher_data(State, BlockSize, Data, []).
