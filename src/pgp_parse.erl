@@ -16,8 +16,8 @@
 -include("OpenSSL.hrl").
 
 -define(err(F,A), io:format((F),(A))).
--define(dbg(F,A), io:format((F),(A))).
-%%-define(dbg(F,A), ok).
+%% -define(dbg(F,A), io:format((F),(A))).
+-define(dbg(F,A), ok).
 -compile(export_all).
 
 %% Section references can be found in
@@ -69,39 +69,80 @@
 
 -type user_id() :: binary().
 -type user_attribute() :: binary().
--type c14n_key() :: binary().
 -type s2k_type() :: {simple, pgp_hash:alg()} |
 		    {salted, pgp_hash:alg(), Salt::binary()} |
 		    {salted, pgp_hash:alg(), Salt::binary(), Count::integer()}.
 
--type packet_type() :: signature | primary_key | subkey | user_id.
+-type packet_type() ::
+	{public_key_encrypted_session_key, 
+	 public_key_encrypted_session_key_param()} |
+	{signature, signature_param()} |
+	{key, key_param()} |
+	{subkey, subkey_param()} |
+	{secret_key, secret_key_param()} |
+	{secret_subkey, secret_subkey_param()} |
+	{user_id, user_id_param()} |
+	{user_attribute, user_attribute_param()} |
+	{literal_data, literal_data_param()} |
+	{compressed, [packet_type()]} |
+	{encrypted, [packet_type()]}.
+	
 
--type cb_params() :: cb_signature() |
-		     cb_key() |
-		     cb_subkey() | 
-		     cb_user_id().
+-type literal_data_param() ::
+	#{ format => $t | $b,
+	   value => iolist() }.
 
--type cb_signature() :: 
+-type public_key_encrypted_session_key_param() ::
+	#{ public_key_algorithm => pgp:public_key_algorithm(),
+	   use => pgp:key_use(),
+	   symmetric_key => binary(),
+	   cipher => pgp_cipher:cipher(),
+	   key_id => pgp:key_id()
+	 }.
+
+-type signature_param() :: 
 	#{ verified => boolean() | error | disabled,
-	   signature_data => binary(),   %% raw data
+	   signature => binary(),
 	   signature_level => [$\s]|[$1]|[$2]|[$3],  %% SignatureType
 	   signature_creation_time => integer(),
 	   signature_expiration_time => integer(),
-	   key_expiration => integer(),
+	   public_key_algorithm => pgp:public_key_algorithm(),
+	   issuer => pgp:key_id(),
 	   policy_uri => binary()
 	 }.
--type cb_key() :: 
+
+-type key_param() :: 
 	#{ 
-	   key => pgp:public_key()
+	   key_id => pgp:key_id()
 	 }.
--type cb_subkey() :: 
+
+-type subkey_param() :: 
 	#{ 
-	   subkey => pgp:public_key(),
-	   key => pgp:public_key(),
+	   key_id => pgp:key_id(),
+	   primary_key_id => pgp:key_id(),
 	   user_id => binary()
 	 }.
--type cb_user_id() :: 
-	#{ type => user_id
+
+-type secret_key_param() :: 
+	#{ 
+	   key_id => pgp:key_id()
+	 }.
+
+-type secret_subkey_param() :: 
+	#{ 
+	   key_id => pgp:key_id(),
+	   primary_key_id => pgp:key_id(),
+	   user_id => binary()
+	 }.
+
+-type user_id_param() :: 
+	#{ 
+	   value => binary()
+	 }.
+
+-type user_attribute_param() :: 
+	#{ 
+	   value => binary()
 	 }.
 
 %% various fields depending on packet type processed
@@ -171,7 +212,8 @@ encode_packets_([Packet|Packets], Acc, Context) ->
 encode_packets_([], Acc, Context) ->
     {iolist_to_binary(lists:reverse(Acc)), Context}.
 
-encode_packet({public_key_encrypted,Param=#{ key_id := KeyID }},Context) ->
+encode_packet({public_key_encrypted_session_key,Param=#{ key_id := KeyID }},
+	      Context) ->
     Cipher = maps:get(cipher, Param, des_ede3_cbc),
     Key = case maps:get(KeyID, Context, undefined) of
 	      undefined ->
@@ -304,16 +346,10 @@ encode_packet({secrety_subkey, #{ key_id := KeyID }}, Context) ->
     KeyData = pgp_keys:encode_secret_key(Key, Context),
     pack(?SECRET_SUBKEY_PACKET, KeyData, Context#{ subkey_id => KeyID });
 encode_packet({user_attribute, #{ value := UserAttribute }}, Context) ->
-    Len = byte_size(UserAttribute),
-    %% encode for signature/hash
-    UATTR = <<?UATTR_FIELD_TAG, Len:32, UserAttribute/binary>>,
     pack(?USER_ATTRIBUTE_PACKET,UserAttribute,
-	 Context#{ user_attribute => UATTR});
+	 Context#{ user_attribute => UserAttribute});
 encode_packet({user_id, #{ value := UserId }}, Context) ->
-    Len = byte_size(UserId),
-    %% encode for signature/hash
-    UID = <<?UID_FIELD_TAG, Len:32, UserId/binary>>,
-    pack(?USER_ID_PACKET, UserId, Context#{ user_id => UID});
+    pack(?USER_ID_PACKET, UserId, Context#{ user_id => UserId});
 encode_packet({encrypted,Packets}, Context) ->
     %% FIXME: encrypt data using data from context and params
     {Data, Context1} = encode_packets(Packets, Context),
@@ -490,11 +526,12 @@ decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
     #{ type := Type } = SecretKey,
     {Type,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
     {Cipher, SymmetricKey} = pubkey_decrypt(SecretKey, Data),
-    {{public_key_encrypted, #{ algorithm => Type,
-			       symmetric_key => SymmetricKey,
-			       cipher => Cipher,
-			       use => Use,  %% check encrypt?
-			       key_id => KeyID }},
+    {{public_key_encrypted_session_key,
+      #{ algorithm => Type,
+	 symmetric_key => SymmetricKey,
+	 cipher => Cipher,
+	 use => Use,  %% check encrypt?
+	 key_id => KeyID }},
      Context#{ symmetric_key => SymmetricKey,
 	       cipher => Cipher }};
 
@@ -642,15 +679,14 @@ decode_public_key_4(key, KeyData, Context) ->
     Key = pgp_keys:decode_public_key(KeyData),
     #{ key_id := KeyID } = Key,
     {{key, #{ key_id => KeyID }}, 
-     Context#{ key_id => KeyID, KeyID => Key, key_data => KeyData }};
+     Context#{ key_id => KeyID, KeyID => Key }};
 
 decode_public_key_4(subkey, KeyData, Context = #{ key_id := KeyID }) ->
     SubKey = pgp_keys:decode_public_key(KeyData),
     #{ key_id := SubKeyID } = SubKey,
     {{subkey, #{ key_id => SubKeyID, 
 		 primary_key_id => KeyID }, [user_id]},
-     Context#{ subkey_id => SubKeyID, SubKeyID => SubKey, 
-	       subkey_data => KeyData }}.
+     Context#{ subkey_id => SubKeyID, SubKeyID => SubKey }}.
 
 %% version 4
 decode_secret_key_4(secret_key, KeyData, Context) ->
@@ -679,21 +715,8 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
             %% 0x19: Primary Key Binding Signature
             KeyBinding when KeyBinding =:= 16#18 orelse KeyBinding =:= 16#19 ->
 		#{ key_id := KeyID, subkey_id := SubKeyID } = Context,
-		%% #{ key_data := KeyData0, subkey_data := SubKeyData0 } = Context,
 		Key = maps:get(KeyID, Context),
 		KeyData = pgp_keys:encode_public_key(Key),
-
-		%% if KeyData =/= KeyData0 ->
-		%% 	io:format("KeyData[~w]\n~p\n",
-		%% 		  [byte_size(KeyData),KeyData]),
-		%% 	io:format("KeyData0[~w]\n~p\n",
-		%% 		  [byte_size(KeyData0),KeyData0]),
-		%% 	io:format("Diff = ~w\n",
-		%% 		  [pgp_util:bindiff(KeyData, KeyData0)]);
-		%%    true ->
-		%% 	ok
-		%% end,
-
 		SigKeyData = pgp_util:sig_data(KeyData),
 		SubKey = maps:get(SubKeyID, Context),
 		SubKeyData = pgp_keys:encode_public_key(SubKey),
@@ -709,21 +732,8 @@ hash_signature_packet(SignatureType, PublicKeyAlgorithm, HashAlg,
                                 Certification =< 16#13) orelse
                                Certification == 16#30 ->
 		#{ key_id := KeyID, user_id := UserId } = Context,
-		#{ key_data := KeyData0 } = Context,
 		Key = maps:get(KeyID, Context),
 		KeyData = pgp_keys:encode_public_key(Key),
-
-		if KeyData =/= KeyData0 ->
-			io:format("KeyData[~w]\n~p\n",
-				  [byte_size(KeyData),KeyData]),
-			io:format("KeyData0[~w]\n~p\n",
-				  [byte_size(KeyData0),KeyData0]),
-			io:format("Diff = ~w\n",
-				  [pgp_util:bindiff(KeyData, KeyData0)]);
-		   true ->
-			ok
-		end,
-
 		SigKeyData = pgp_util:sig_data(KeyData),
                 UID =
 		    case maps:get(user_attribute, Context, undefined) of
@@ -818,7 +828,7 @@ decode_subpacket(<<?SIGNATURE_EXPIRATION_TIME_SUBPACKET, Timestamp:32>>,
 %% 5.2.3.17.  Key Server Preferences
 decode_subpacket(<<?KEY_SERVER_PREFERENCES, Flags/binary>>, Context) ->
     Param = decode_param(#{ value => Flags }, Context),
-    {{key_server_preferences, Param}, 
+    {{key_server_preferences, Param},
      Context#{ key_server_preferences => Flags }};
 %% 5.2.3.18.  Preferred Key Server
 decode_subpacket(<<?PREFERRED_KEY_SERVER, Server/binary>>, Context) ->
@@ -866,6 +876,11 @@ encode_subpackets_([], Acc, Context) ->
 
 
 %% 5.2.3.4.  Signature Creation Time
+encode_subpacket({signature_creation_time,now}, Context) ->
+    DateTime = pgp_util:utc_datetime(),
+    Timestamp = pgp_util:datetime_to_timestamp(DateTime),
+    pack_sub(?SIGNATURE_CREATION_TIME_SUBPACKET,<<Timestamp:32>>,
+	     #{}, Context);
 encode_subpacket({signature_creation_time,Param=#{ value := DateTime }},
 		 Context) ->
     Timestamp = pgp_util:datetime_to_timestamp(DateTime),

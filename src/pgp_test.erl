@@ -15,9 +15,10 @@ test_0() ->
     Context = #{ KeyID => Public },
     Content =
 	[
-	 {public_key_encrypted, #{ key_id => KeyID,
-				   symmetric_key => <<"123456781234567812345678">>
-				 }}
+	 {public_key_encrypted_session_key,
+	  #{ key_id => KeyID,
+	     symmetric_key => <<"123456781234567812345678">>
+	   }}
 	],
     {Data, _} = pgp_parse:encode(Content, Context),
     pgp_parse:decode(Data, #{  KeyID => Secret }).
@@ -32,7 +33,7 @@ test_1() ->
     Context = #{ KeyID => Public },
     Content =
 	[
-	 {public_key_encrypted, #{ key_id => KeyID }},
+	 {public_key_encrypted_session_key, #{ key_id => KeyID }},
 	 {encrypted,
 	  [
 	   {literal_data,#{ format => $t, value => "Hello" }},
@@ -55,6 +56,45 @@ test_2() ->
 	  ]}],
     {Data, _} = pgp_parse:encode(Content, #{ }),
     pgp_parse:decode(Data, #{  password => "hello" }).
+
+
+%% Test code to create signed key
+test_3() ->
+    make_pubkey_packet().
+
+make_pubkey_packet() ->
+    {_Public,Secret} = pgp_keys:generate_rsa_key(),  %% test key
+    make_pubkey_packet(Secret).
+
+make_pubkey_packet(SigningKey) ->
+    _SubKey = {Public,_Secret} = pgp_keys:generate_mixmesh_key(1024),
+    make_pubkey_packet(SigningKey, Public).
+
+make_pubkey_packet(SigningKey = #{ key_id := KeyID }, 
+		   SubKey = #{ key_id := SubKeyID }) ->
+    Packets = 
+	[{key, #{ key_id => KeyID }},
+	 {user_id, #{ value => <<"Joe Smith (mixmesh) <joe@secret.org>">>}},
+	 {signature, #{ signature_type => 16#13,  %% certification
+			hash_algorithm => sha256,
+			hashed => [{issuer_fingerprint,self},
+				   {signature_creation_time,now},
+				   {key_flags,#{ value => <<3>> }}
+				  ],
+			unhashed => [{issuer, self}] }},
+	 {subkey, #{ key_id => SubKeyID, primary_key_id => KeyID }},
+	 {signature, #{ signature_type => 16#18,  %% subkey binding
+			hash_algorithm => sha256,
+			hashed => [{issuer_fingerprint,primary},
+				   {signature_creation_time,now},
+				   {key_flags,#{ value => <<12>> }}
+				  ],
+			unhashed => [{issuer, primary}] }}
+	],
+    Context = #{ KeyID => SigningKey, SubKeyID => SubKey },
+    {Data, _Context} = pgp_parse:encode_packets(Packets, Context),
+    pgp_armor:encode_pubkey(Data).
+
 
 %% fixme!
 -define(NEW_PACKET_FORMAT, 2#11).

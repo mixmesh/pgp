@@ -9,7 +9,9 @@
 
 -export([timestamp_to_datetime/1,
 	 timestamp_to_local_datetime/1,
-	 datetime_to_timestamp/1]).
+	 datetime_to_timestamp/1,
+	 utc_datetime/0,
+	 local_datetime/0]).
 
 -export([decode_mpi/1]).
 -export([decode_mpi_list/2]).
@@ -48,6 +50,16 @@ timestamp_to_local_datetime(Timestamp) ->
 
 datetime_to_timestamp(UTCDateTime) ->
     calendar:datetime_to_gregorian_seconds(UTCDateTime) - ?UNIX_SECONDS.
+
+utc_datetime() ->
+    case calendar:local_time_to_universal_time_dst({date(),time()}) of
+	[DateTime] -> DateTime;
+	[_, DateTime] -> DateTime;
+	[] -> calendar:local_time()  %% need a value that is not zero!!!
+    end.
+
+local_datetime() ->
+    calendar:local_time().
 
 %% given number of expected mpi data,
 %% calculate byte length for mpi data + length bytes
