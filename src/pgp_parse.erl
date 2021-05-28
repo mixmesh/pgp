@@ -538,24 +538,24 @@ decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
                 Algorithm,
 		Data/binary>>,
 	      Context) ->
-    SecretKey = case maps:get(KeyID, Context, undefined) of
-		    undefined ->
-			KeyFindFun = maps:get(keyfind_fun, Context),
-			KeyFindFun(KeyID, secret, Context);
-		    Key0 ->
-			Key0
-		end,
-    #{ type := Type } = SecretKey,
-    {Type,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
-    {Cipher, SymmetricKey} = pubkey_decrypt(SecretKey, Data),
-    {{public_key_encrypted_session_key,
-      #{ algorithm => Type,
-	 symmetric_key => SymmetricKey,
-	 cipher => Cipher,
-	 use => Use,  %% check encrypt?
-	 key_id => KeyID }},
-     Context#{ symmetric_key => SymmetricKey,
-	       cipher => Cipher }};
+    ?dbg("lookup public key: ~s\n", [pgp_util:format_keyid(KeyID)]),
+    case find_key(KeyID, Context) of
+	false ->
+	    ?dbg("not found\n", []),
+	    %% go on may be other keys that work
+	    {{public_key_encrypted_session_key, #{}}, Context};
+	SecretKey = #{ type := Type } ->
+	    {Type,Use} = pgp_keys:dec_pubkey_alg(Algorithm),
+	    {Cipher, SymmetricKey} = pubkey_decrypt(SecretKey, Data),
+	    {{public_key_encrypted_session_key,
+	      #{ algorithm => Type,
+		 symmetric_key => SymmetricKey,
+		 cipher => Cipher,
+		 use => Use,  %% check encrypt?
+		 key_id => KeyID }},
+	     Context#{ symmetric_key => SymmetricKey,
+		       cipher => Cipher }}
+    end;
 
 %% Section 5.2: Signature Packet (Tag 2)
 decode_packet(?SIGNATURE_PACKET,
@@ -696,28 +696,29 @@ decode_packet(?ENCRYPTED_PACKET, CData, Context) ->
     ?dbg("encrypted: Data[~w]=~p\n", [byte_size(Data),Data]),
     decode_packets(Data, Context);
 
-decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,CData/binary>>, Context) ->
+decode_packet(?ENCRYPTED_PROTECTED_PACKET, 
+	      <<_Version,CData/binary>>, Context) ->
+    %% Fixme check version...
     #{ cipher := Cipher, symmetric_key := SymmetricKey } = Context,
-    BS = pgp_cipher:block_size(Cipher),
+    _BS = pgp_cipher:block_size(Cipher),
     {Prefix,Data0} = pgp_cipher:decrypt(openpgp2,Cipher,
 					undefined,CData,SymmetricKey),
-    ?dbg("encrypted_protected: version=~w\n", [Version]),
-
+    ?dbg("encrypted_protected: version=~w\n", [_Version]),
     %% FIXME PADDING = BS - (messagelen + 2 +22) rem BS???
     %% Assume that packet is padded with zeros 22 = 20+2 (the mdc packet)
     ?dbg("plaintext[~w] = ~p\n", [byte_size(Data0),Data0]),
-    TagHP = {Tag,1,PLen0} = packet_len(Data0),  %% length is not fixed!
+    TagHP = {_Tag,HLen0,PLen0} = packet_len(Data0),  %% length is not fixed!
     ?dbg("packet_len=~p\n", [TagHP]),
-    MDCPacketLen = 20+2,
-    PLen = PLen0 - MDCPacketLen,
-    <<PlainText:(1+PLen)/binary,MDCData:MDCPacketLen/binary>> = Data0,
-    TagHP1 = {Tag1,HLen1,PLen1} = packet_len(MDCData),
-    ?dbg("mdc_packet_len=~p\n", [TagHP1]),
-
-    {{Tag1,MDC},<<>>} = unpack_packet(MDCData),
-    ?dbg("mdc: ~p\n", [MDC]),
-
-    %% <<Prefix:(BS+2)/binary, _/binary>> = CData,
+    {PlainText,MDC} =
+	if HLen0 =:= 1 -> %% indeterminate
+		PLen = PLen0 - (20+2),
+		<<PText:(1+PLen)/binary,_:2/binary,MDC0:20/binary>> = Data0,
+		{PText,MDC0};
+       true ->
+		<<PText:(HLen0+PLen0)/binary,
+		  _:2/binary,MDC0:20/binary>> = Data0,
+		{PText,MDC0}
+	end,
     MDC_Check = crypto:hash(sha, [Prefix,PlainText,16#D3,16#14]),
     ?dbg("mdc_check: ~p\n", [MDC_Check]),
     Valid = MDC =:= MDC_Check,
@@ -759,6 +760,21 @@ decode_secret_key_4(secret_subkey, KeyData, Context = #{ key_id := KeyID }) ->
     {{secret_subkey, #{ key_id => SubKeyID, primary_key_id => KeyID },
       [user_id]},
      Context#{ subkey_id => SubKeyID, SubKeyID => SubKey  }}.
+
+%%
+%% Lookup secret key in the context
+%%
+find_key(KeyID, Context) ->
+    case maps:get(KeyID, Context, undefined) of
+	undefined ->
+	    case maps:get(key_lookup_fun, Context, undefined) of
+		undefined -> false; %% key not found
+		KeyLookupFun when is_function(KeyLookupFun,3) ->
+		    KeyLookupFun(KeyID, secret, Context)
+	    end;
+	Key ->
+	    Key
+    end.
 
 %%
 %% Signature packet handling

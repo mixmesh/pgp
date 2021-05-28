@@ -33,6 +33,8 @@
 
 %% debugging aid
 -export([bindiff/2]).
+-export([format_fingerprint/1]).
+-export([format_keyid/1]).
 
 -define(KEY_FIELD_TAG, 16#99).
 
@@ -173,6 +175,18 @@ fingerprint_to_key_id(Fingerprint) ->
 -spec key_id(KeyData::binary()) -> pgp:key_id().
 key_id(KeyData) ->
     fingerprint_to_key_id(fingerprint(KeyData)).
+
+
+format_fingerprint(Fingerprint) ->
+    Size = byte_size(Fingerprint),
+    <<Finger:(Size-8)/binary, KeyID:8/binary>> = Fingerprint,
+    iolist_to_binary([format_hex(Finger),"(",format_hex(KeyID),")"]).
+    
+format_keyid(KeyID) ->
+    iolist_to_binary(format_hex(KeyID)).
+
+format_hex(Data) ->
+    [tl(integer_to_list(D+16#100,16)) || <<D>> <= Data].
 
 %% bindiff return a list (max MAXDIFF) positions where two
 %% binaries differ
