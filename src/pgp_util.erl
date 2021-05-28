@@ -164,15 +164,15 @@ fingerprint(KeyData) ->
     Data = sig_data(KeyData),
     crypto:hash(sha, Data).
 
--spec key_id(KeyData::binary()) -> pgp:key_id().
-key_id(KeyData) ->
-    <<KeyID:8/binary, _/binary>> = fingerprint(KeyData),
-    KeyID.
-
 -spec fingerprint_to_key_id(Fingerprint::pgp:fingerprint()) -> pgp:key_id().
 fingerprint_to_key_id(Fingerprint) ->
-    <<KeyID:8/binary, _/binary>> = Fingerprint,
+    Size = byte_size(Fingerprint),
+    <<_:(Size-8)/binary, KeyID:8/binary>> = Fingerprint,
     KeyID.
+
+-spec key_id(KeyData::binary()) -> pgp:key_id().
+key_id(KeyData) ->
+    fingerprint_to_key_id(fingerprint(KeyData)).
 
 %% bindiff return a list (max MAXDIFF) positions where two
 %% binaries differ

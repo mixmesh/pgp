@@ -20,8 +20,8 @@
 -export([public_params/1, private_params/1]).
 
 %% -compile(export_all).
--define(dbg(F,A), io:format((F),(A))).
-%%-define(dbg(F,A), ok).
+%% -define(dbg(F,A), io:format((F),(A))).
+-define(dbg(F,A), ok).
 
 -define(KEY_PACKET_VERSION, 4).
 
@@ -176,25 +176,25 @@ encrypt_key_data(List, Context) ->
 	    Cipher = maps:get(cipher, Context, des_ede3_cbc),
 	    Checksum = maps:get(checksum, Context, hash),
 	    CipherAlgorithm = pgp_cipher:encode(Cipher),
-	    S2K = pgp_cipher:adjust_s2k(maps:get(s2k, Context, {simple, md5})),
+	    S2K = pgp_s2k:adjust(maps:get(s2k, Context, {simple, md5})),
 	    {S2KUse,S2KSpec,Data1} =
 		case Checksum of
 		    none ->
 			{CipherAlgorithm,<<>>,Data};
 		    checksum ->
 			CheckSum = pgp_util:checksum(Data),
-			S2KBin = pgp_cipher:encode_s2k(S2K),
+			S2KBin = pgp_s2k:encode(S2K),
 			{255,<<CipherAlgorithm,S2KBin/binary>>,
 			 <<CheckSum:16, Data/binary>>};
 		    hash ->
 			Hash = crypto:hash(sha, Data),
-			S2KBin = pgp_cipher:encode_s2k(S2K),
+			S2KBin = pgp_s2k:encode(S2K),
 			{254,<<CipherAlgorithm,S2KBin/binary>>,
 			 <<Hash:20/binary, Data/binary>>}
 		end,
 	    ?dbg("S2KUse=~w, S2KSpec=~w,\n", [S2KUse, S2KSpec]),
 	    ?dbg("Data1[~w]=~p,\n", [byte_size(Data1), Data1]),
-	    case pgp_cipher:encrypt(Cipher,S2K,Data1,Password) of
+	    case pgp_cipher:encrypt(cfb,Cipher,S2K,Data1,Password) of
 		Data2 when is_binary(Data2) ->
 		    ?dbg("Data2[~w]=~p,\n", [byte_size(Data2), Data2]),
 		    <<S2KUse,S2KSpec/binary,Data2/binary>>;
@@ -280,47 +280,47 @@ decrypt_key_data(<<0,CheckSum:16,Data/binary>>, _N, _Context) ->
     ?dbg("decrypt_key_data: checksum, cipher=plaintext\n", []),
     CheckSum = pgp_util:checksum(Data),
     Data;
-decrypt_key_data(<<254, CipherAlgorim, Data/binary>>, N, Context) ->
-    {S2K, Data1} = pgp_cipher:decode_s2k(Data),
-    Cipher = pgp_cipher:decode(CipherAlgorim),
+decrypt_key_data(<<254, CipherAlgorithm, Data0/binary>>, N, Context) ->
+    {S2K, CData} = pgp_s2k:decode(Data0),
+    Cipher = pgp_cipher:decode(CipherAlgorithm),
     ?dbg("decrypt_key_data: hash s2k=~w, cipher=~w\n", [S2K,Cipher]),
     Password = maps:get(password, Context),
-    case pgp_cipher:decrypt(Cipher,S2K,Data1,Password) of
-	<<Hash:20/binary, Data2/binary>> ->
-	    Len = pgp_util:mpi_len(Data2, N),
-	    <<Data3:Len/binary, _ZData/binary>> = Data2,
-	    ?dbg("Data3[~w] = ~p\n", [byte_size(Data3), Data3]),
-	    case crypto:hash(sha, Data3) of
-		Hash -> Data3;
-		_ ->
-		    {error,bad_hash}
-	    end;
-	Error ->
-	    Error
+    ?dbg("decrypt_key_data[~w] = ~p\n", [byte_size(CData),CData]),
+    Data = pgp_cipher:decrypt(cfb,Cipher,S2K,CData,Password),
+    Size = byte_size(Data) - 20,
+    <<Data2:Size/binary, Hash:20/binary>> = Data, %% need pad check?
+    ?dbg("plain hash-sha: ~p\n", [Hash]),
+    ?dbg("plain_key_data[~w] = ~p\n", [byte_size(Data2),Data2]),
+    Len = pgp_util:mpi_len(Data2, N),
+    <<Data3:Len/binary, _ZData/binary>> = Data2,
+    ?dbg("Data3[~w] = ~p\n", [byte_size(Data3), Data3]),
+    case crypto:hash(sha, Data3) of
+	Hash -> 
+	    Data3;
+	_ ->
+	    {error,bad_hash}
     end;
-decrypt_key_data(<<255, CipherAlgorithm, Data/binary>>, N, Context) ->
-    {S2K, Data1} = pgp_cipher:decode_s2k(Data),
+decrypt_key_data(<<255, CipherAlgorithm, Data0/binary>>, N, Context) ->
+    {S2K, CData} = pgp_s2k:decode(Data0),
     Cipher = pgp_cipher:decode(CipherAlgorithm),
     ?dbg("decrypt_key_data: checksum s2k=~w, cipher=~w\n", [S2K,Cipher]),
     Password = maps:get(password, Context),
-    case pgp_cipher:decrypt(Cipher,S2K,Data1,Password) of
-	<<CheckSum:16,Data2/binary>> ->
-	    Len = pgp_util:mpi_len(Data2, N),
-	    <<Data3:Len/binary, _ZData/binary>> = Data2,
-	    case pgp_util:checksum(Data3) of
-		CheckSum -> Data3;
-		_ -> {error,bad_checksum}
-	    end;
-	Error ->
-	    Error
+    Data = pgp_cipher:decrypt(cfb,Cipher,S2K,CData,Password),
+    Size = byte_size(Data) - 2,
+    <<Data2:Size/binary, CheckSum:16>> = Data,  %% need pad check?
+    Len = pgp_util:mpi_len(Data2, N),
+    <<Data3:Len/binary, _ZData/binary>> = Data2,
+    case pgp_util:checksum(Data3) of
+	CheckSum -> Data3;
+	_ -> {error,bad_checksum}
     end;
-decrypt_key_data(<<CipherAlgorithm, Data/binary>>, N, Context) ->
+decrypt_key_data(<<CipherAlgorithm, CData/binary>>, N, Context) ->
     Cipher = pgp_cipher:decode(CipherAlgorithm),
     ?dbg("decrypt_key_data: s2k=~w, cipher=~w\n", [{simple,md5},Cipher]),
     Password = maps:get(password, Context),
-    Data2 = pgp_cipher:decrypt(Cipher,{simple,md5},Data,Password),
-    Len = pgp_util:mpi_len(Data2, N),
-    <<Data3:Len/binary, _ZData/binary>> = Data2,
+    Data = pgp_cipher:decrypt(cfb,Cipher,{simple,md5},CData,Password),
+    Len = pgp_util:mpi_len(Data, N),
+    <<Data3:Len/binary, _ZData/binary>> = Data,
     Data3.
 
 

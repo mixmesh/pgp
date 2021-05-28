@@ -9,7 +9,7 @@ Set encryption password, this is the only required parameter for encryption.
 
     #{ cipher => Cihper }
 
-Cipher is one of des_ede3_cbc | blowfish_cfb64 | aes_128_cbc | aes_192_cbc | aes_256_cbc (default is des_ede3_cbc)
+Cipher is one of des3 | blowfish | aes\_128 | aes\_192 | aes\_256 (default is des3)
 
 Set password to key transformation
 

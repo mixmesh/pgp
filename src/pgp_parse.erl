@@ -16,7 +16,7 @@
 -include("OpenSSL.hrl").
 
 -define(err(F,A), io:format((F),(A))).
-%% -define(dbg(F,A), io:format((F),(A))).
+%%-define(dbg(F,A), io:format((F),(A))).
 -define(dbg(F,A), ok).
 -compile(export_all).
 
@@ -41,11 +41,13 @@
 -define(SECRET_SUBKEY_PACKET, 7).
 -define(COMPRESSED_PACKET,    8).
 -define(ENCRYPTED_PACKET, 9).
--define(LITERAL_DATA_PACKET, 10).
+-define(MARKER_PACKET, 10).
+-define(LITERAL_DATA_PACKET, 11).
 -define(USER_ID_PACKET, 13).
 -define(PUBLIC_SUBKEY_PACKET, 14).
 -define(USER_ATTRIBUTE_PACKET, 17).
 -define(ENCRYPTED_PROTECTED_PACKET, 18).
+-define(MODIFICATION_DETECTION_CODE_PACKET, 19).
 
 %% Section 5.2.3.1: Signature Subpacket Specification
 -define(SIGNATURE_CREATION_TIME_SUBPACKET, 2).
@@ -69,9 +71,6 @@
 
 -type user_id() :: binary().
 -type user_attribute() :: binary().
--type s2k_type() :: {simple, pgp_hash:alg()} |
-		    {salted, pgp_hash:alg(), Salt::binary()} |
-		    {salted, pgp_hash:alg(), Salt::binary(), Count::integer()}.
 
 -type packet_type() ::
 	{public_key_encrypted_session_key, 
@@ -152,7 +151,7 @@
 	  key_id => pgp:key_id() | undefined,
 	  subkey_id =>  pgp:key_id() | undefined,
 	  symmeric_key => binary() | undefined,
-	  s2k => s2k_type(),
+	  s2k => pgp_s2k:s2k(),
 	  user_id => user_id() | undefined,
 	  user_attribute => user_attribute() | undefined,
 	  issuer => binary()  | undefined,
@@ -217,7 +216,7 @@ encode_packet({public_key_encrypted_session_key,
 	       Param=#{ key_id := KeyID }},
 	      Context) ->
     EKeyID = maps:get(subkey_id, Param, KeyID),
-    Cipher = maps:get(cipher, Param, des_ede3_cbc),
+    Cipher = maps:get(cipher, Param, des3),
     Key = case maps:get(EKeyID, Context, undefined) of
 	      undefined ->
 		  KeylookupFun = maps:get(keylookup_fun, Context),
@@ -227,12 +226,13 @@ encode_packet({public_key_encrypted_session_key,
 	  end,
     #{ type := Type } = Key,
     PubKeyAlgorithm = pgp_keys:enc_pubkey_alg(Type,[encrypt]),
-    #{ key_length := KeyLength } = crypto:cipher_info(Cipher),
+    KeyLength = pgp_cipher:key_length(Cipher),
     {SymmetricKey,Context1} =
 	case maps:get(symmetric_key, Param, undefined) of
 	    undefined ->
 		SymKey = crypto:strong_rand_bytes(KeyLength),
-		{SymKey,Context#{ symmetric_key => SymKey, cipher => Cipher }}; 
+		?dbg("generate session key = ~p\n", [SymKey]),
+		{SymKey,Context#{ symmetric_key => SymKey, cipher => Cipher}}; 
 	    <<SymKey:KeyLength/binary,_/binary>> -> %% match equal?
 		{SymKey, Context#{ cipher => Cipher }}
 	end,
@@ -291,7 +291,7 @@ encode_packet({signature, #{ signature_type := SignatureType,
 
 encode_packet({symmetric_key_encrypted_session_key, Param}, Context) ->
     %% FIXME use preferred
-    Cipher = maps:get(cipher, Param, des_ede3_cbc),
+    Cipher = maps:get(cipher, Param, des3),
     CipherAlgorithm = pgp_cipher:encode(Cipher),
     S2K = maps:get(s2k, Param, {simple, md5}),
     Password =
@@ -303,30 +303,38 @@ encode_packet({symmetric_key_encrypted_session_key, Param}, Context) ->
 	    Pass ->
 		Pass
 	end,
-    Key = pgp_cipher:string_to_key(S2K, Cipher, Password),
+    KeyLength = pgp_cipher:key_length(Cipher),
+    Key = pgp_s2k:string_to_key(S2K, KeyLength, Password),
+    ?dbg("Key[~w]=~p\n", [byte_size(Key), Key]),
     {Data,Context1}
 	= case maps:get(symmetric_key, Param, undefined) of
 	      undefined ->
 		  %% use the password it self
 		  {<<>>, Context#{ symmetric_key => Key, cipher => Cipher }};
 	      SymmetricKey ->
-		  #{ iv_length := IVLength, block_size := BlockSize } = 
-		      crypto:cipher_info(Cipher),
+		  IVLength = pgp_cipher:iv_length(Cipher),
 		  IVZ = <<0:IVLength/unit:8>>,
-		  State = crypto:crypto_init(Cipher,Key,IVZ,[{encrypt,true}]),
 		  Data0 = <<CipherAlgorithm, SymmetricKey/binary>>,
-		  {pgp_cipher:cipher_data(State,BlockSize,Data0),
-		   Context#{cipher => Cipher}}
+		  CData = pgp_cipher:encrypt_cfb(Cipher,Key,IVZ,Data0),
+		  {CData,Context#{cipher => Cipher}}
 	  end,
-    S2KBin = pgp_cipher:encode_s2k(S2K),
+    S2KBin = pgp_s2k:encode(S2K),
     pack(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
 	 <<?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET_VERSION,
 	   CipherAlgorithm, S2KBin/binary, Data/binary>>, Context1);
 
-encode_packet({literal_data,#{ format := Format,
-			value := Data }}, Context) ->
+encode_packet({literal_data,Params=#{ format := Format,
+				      value := Data }}, Context) ->
+    Fname = maps:get(filename, Params, ""),
+    Fmt = maps:get(Format, #{ binary => $b, text => $t,
+			      utf8 => $u, local => $l }, Format),
+    Filename = iolist_to_binary(Fname),
+    DateTime = maps:get(date, Params, pgp_util:utc_datetime()),
+    Timestamp = pgp_util:datetime_to_timestamp(DateTime),
     Data1 = iolist_to_binary(Data),
-    pack(?LITERAL_DATA_PACKET, <<Format,Data1/binary>>, Context);
+    pack(?LITERAL_DATA_PACKET,
+	 <<Fmt,(byte_size(Filename)),Filename/binary,
+	   Timestamp:32, Data1/binary>>, Context);
 encode_packet({compressed,Packets}, Context) ->
     Data = encode_packets(Packets, Context),
     Default = [zip,uncompressed],
@@ -354,18 +362,10 @@ encode_packet({user_attribute, #{ value := UserAttribute }}, Context) ->
 encode_packet({user_id, #{ value := UserId }}, Context) ->
     pack(?USER_ID_PACKET, UserId, Context#{ user_id => UserId});
 encode_packet({encrypted,Packets}, Context) ->
-    %% FIXME: encrypt data using data from context and params
     {Data, Context1} = encode_packets(Packets, Context),
     #{ cipher := Cipher, symmetric_key := SymmetricKey } = Context1,
-    #{ iv_length := IVLength, block_size := BlockSize } =
-	crypto:cipher_info(Cipher),
-    IVZ = <<0:IVLength/unit:8>>,
-    State = crypto:crypto_init(Cipher,SymmetricKey,IVZ,[{encrypt,true}]),
-    Prefix = symmetric_prefix(BlockSize),
-    %% FIXME: encrypt prefix one round and reset?
-    Data1 = <<Prefix/binary,Data/binary>>,
-    Data2 = pgp_cipher:cipher_data(State,BlockSize,Data1),
-    pack(?ENCRYPTED_PACKET, Data2, Context1);
+    CData = pgp_cipher:encrypt(openpgp, Cipher, undefined, Data, SymmetricKey),
+    pack(?ENCRYPTED_PACKET, CData, Context1);
 encode_packet({encrypted_protected, #{ version := _Version,value := _Data}},
        Context) ->
     %% FIXME: encrypt data using data from context and params
@@ -374,11 +374,6 @@ encode_packet({encrypted_protected, #{ version := _Version,value := _Data}},
 compress_packet(PreferedAlgorithms, Data, Context) ->
     {Algorithm,Data1} = pgp_compress:compress(PreferedAlgorithms, Data),
     pack(?COMPRESSED_PACKET, <<Algorithm,Data1/binary>>, Context).
-
-symmetric_prefix(BlockSize) ->
-    Rand = crypto:strong_rand_bytes(BlockSize),
-    <<_:(BlockSize-2)/binary,Rep:2/binary>> = Rand,
-    <<Rand/binary, Rep/binary>>.
 
 %%
 %% Encode packet
@@ -428,23 +423,63 @@ encode_chunked_body(Data, Exp, Acc) when Exp < 32 ->
 %% Decode packets
 %%
 decode_packets(Data, Context) ->
+    %% dump_packets(Data),
     decode_packets_(Data, Context, []).
 
-%% FIXME: handle trailing zeros better (from encypted data without length!)
+%% debug
+dump_packets(<<>>) ->
+    ok;
+dump_packets(Data) ->
+    case Data of
+	<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data1/binary>> ->
+	    {PacketData,Data2} =  unpack_old_body(LengthType,Data1),
+	    io:format("old:tag:~w: data=~w\n", [Tag,PacketData]),
+	    dump_packets(Data2);
+	<<?NEW_PACKET_FORMAT:2, Tag:6, Data1/binary>> ->
+	    {PacketData, Data2} =  unpack_body(Data1),
+	    io:format("new:tag:~w: data=~w\n", [Tag,PacketData]),
+	    dump_packets(Data2)
+    end.
+
+unpack_packet(<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data/binary>>) ->
+    {PacketData,Data1} = unpack_old_body(LengthType,Data),
+    {{Tag,PacketData},Data1};
+unpack_packet(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>) ->
+    {PacketData,Data1} = unpack_body(Data),
+    {{Tag,PacketData},Data1}.
+
+%% length of packet return {HdrLen,DataLen}
+packet_len(<<?OLD_PACKET_FORMAT:2,Tag:4,0:2,Len:8,_/binary>>) ->
+    {Tag,1+1,Len};
+packet_len(<<?OLD_PACKET_FORMAT:2,Tag:4,1:2,Len:16,_/binary>>) ->
+    {Tag,1+2,Len};
+packet_len(<<?OLD_PACKET_FORMAT:2,Tag:4,2:2,Len:32,_/binary>>) ->
+    {Tag,1+4,Len};
+packet_len(<<?OLD_PACKET_FORMAT:2,Tag:4,3:2,Rest/binary>>) ->
+    {Tag,1,byte_size(Rest)};
+packet_len(<<?NEW_PACKET_FORMAT:2,Tag:6,2#110:3,Len:13,_/binary>>) ->
+    {Tag,1+2,Len+192};
+packet_len(<<?NEW_PACKET_FORMAT:2,Tag:6,2#111:3,2#11111:5,Len:32,_/binary>>) ->
+    {Tag,2+4,Len};
+packet_len(<<?NEW_PACKET_FORMAT:2,Tag:6,2#111:3,Exp:5,_/binary>>) ->
+    {Tag,2,(1 bsl Exp)};
+packet_len(<<?NEW_PACKET_FORMAT:2,Tag:6,Len:8,_/binary>>) ->
+    %% length of first fragment
+    {Tag,2,Len}.
+
 decode_packets_(<<>>, Context, Acc) -> {lists:reverse(Acc),Context};
-decode_packets_(<<0>>, Context, Acc) ->  {lists:reverse(Acc),Context};
-decode_packets_(<<0,0>>, Context, Acc) ->  {lists:reverse(Acc),Context};
-decode_packets_(<<0,0,0>>, Context, Acc) -> {lists:reverse(Acc),Context};
 %% Section 4.2.1: Old Format Packet Lengths
 decode_packets_(<<?OLD_PACKET_FORMAT:2, Tag:4, LengthType:2, Data/binary>>,
 		Context, Acc) ->
     {PacketData,Data1} =  unpack_old_body(LengthType,Data),
+    ?dbg("old_packet: tag ~p\n", [Tag]),
     {Packet,Context1} = decode_packet(Tag, PacketData, Context),
     Packet1 = extend_packet(Packet, Context1),
     decode_packets_(Data1, Context1, [Packet1|Acc]);
 %% Section 4.2.2: New Format Packet Lengths
 decode_packets_(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>, Context, Acc) ->
     {PacketData, Data1} =  unpack_body(Data),
+    ?dbg("new_packet: tag ~p\n", [Tag]),
     {Packet, Context1} = decode_packet(Tag, PacketData, Context),
     Packet1 = extend_packet(Packet, Context1),
     decode_packets_(Data1, Context1, [Packet1|Acc]).
@@ -460,19 +495,18 @@ extend_packet({Name,Param,Fields},Context) ->
 extend_packet(List, _Context) when is_list(List) -> %% packet list
     List.
 
-
-unpack(<<?NEW_PACKET_FORMAT:2, Tag:6, Data/binary>>) ->
-    {Packet,Data1} = unpack_body(Data),
-    {{Tag,Packet},Data1}.
-
 unpack_body(<<2#110:3,Len:13,Packet:(Len+192)/binary,Rest/binary>>) ->
+    %%?dbg("unpack_body: 110 Len:13=~w\n", [Len+192]),
     {Packet, Rest};
 unpack_body(<<2#111:3,2#11111:5,Len:32,Packet:Len/binary,Rest/binary>>) ->
+    %%?dbg("unpack_body: 111 Len:32=~w\n", [Len]),
     {Packet, Rest};
 unpack_body(<<2#111:3,Exp:5,Partial:(1 bsl Exp)/binary,Rest/binary>>) ->
+    %%?dbg("unpack_body: 111 exp:5=~w, len=~w\n", [Exp,(1 bsl Exp)]),
     unpack_body_parts(Rest, [Partial]);
 %% 00/01/10
 unpack_body(<<Len:8,Packet:Len/binary,Rest/binary>>) ->
+    %%?dbg("unpack_body: 00/01/10 Len:8=~w\n", [Len]), 
     {Packet, Rest}.
 
 unpack_body_parts(<<2#110:3,Len:13,Packet:(Len+192)/binary,Rest/binary>>,Ps) ->
@@ -484,7 +518,6 @@ unpack_body_parts(<<2#111:3,Exp:5,Partial:(1 bsl Exp)/binary,Rest/binary>>,Ps) -
 unpack_body_parts(<<Len:8,Packet:Len/binary,Rest/binary>>,Ps) ->
     {iolist_to_binary(lists:reverse([Packet|Ps])),Rest}.
 
-
 unpack_old_packet(<<?OLD_PACKET_FORMAT:2,Tag:4,LengthType:2,Data/binary>>) ->
     {Packet,Data1} = unpack_old_body(LengthType, Data),
     {{Tag,Packet}, Data1}.
@@ -494,23 +527,9 @@ unpack_old_body(0, <<Len:8,Packet:Len/binary,Rest/binary>>) ->
 unpack_old_body(1, <<Len:16,Packet:Len/binary,Rest/binary>>) ->
     {Packet, Rest};
 unpack_old_body(2, <<Len:32,Packet:Len/binary,Rest/binary>>) ->
-    {Packet, Rest}.
-
-%% old new_packet variant
-unpack_new_packet0(<<Length, Packet:Length/binary, RemainingPackets/binary>>)
-   when Length =< 191 ->
-    %% One octet packet length
-    {Packet, RemainingPackets};
-unpack_new_packet0(<<FirstOctet, SecondOctet, Rest/binary>>)
-  when FirstOctet >= 192 andalso FirstOctet =< 223 ->
-    Length = (FirstOctet - 192) bsl 8 + SecondOctet + 192,
-    <<Packet:Length/binary, RemainingPackets/binary>> = Rest,
-    %% Two octet packet length
-    {Packet, RemainingPackets};
-unpack_new_packet0(<<255, Length:32, Packet:Length/binary,
-                    RemainingPackets/binary>>) ->
-    %% Five octet packet length
-    {Packet, RemainingPackets}.
+    {Packet, Rest};
+unpack_old_body(3, Packet) ->
+    {Packet, <<>>}.
 
 %% Section 5.1: Public-Key Encrypted Session Key Packet (Tag 2)
 decode_packet(?PUBLIC_KEY_ENCRYPTED_PACKET,
@@ -600,7 +619,7 @@ decode_packet(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
 	      <<?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET_VERSION,
 		CipherAlgorithm, Data/binary>>, Context) ->
     Cipher = pgp_cipher:decode(CipherAlgorithm),
-    {S2K, Data1} = pgp_cipher:decode_s2k(Data),
+    {S2K, Data1} = pgp_s2k:decode(Data),
     Password =
 	case maps:get(password, Context, undefined) of
 	    undefined ->
@@ -609,17 +628,19 @@ decode_packet(?SYMMETRIC_KEY_ENCRYPTED_SESSION_KEY_PACKET,
 	    Pass ->
 		Pass
 	end,
-    Key = pgp_cipher:string_to_key(S2K, Cipher, Password),
+    KeyLength = pgp_cipher:key_length(Cipher),    
+    Key = pgp_s2k:string_to_key(S2K, KeyLength, Password),
+    ?dbg("S2K = ~p\n", [S2K]),
+    ?dbg("Key[~w]=~p\n", [byte_size(Key), Key]),
+    ?dbg("Data1 = ~p\n", [Data1]),
     SymmetricKey =
 	case Data1 of
 	    <<>> ->
 		Key;
 	    Encrypted ->
-		#{ iv_length := IVLength, block_size := BlockSize } = 
-		    crypto:cipher_info(Cipher),
+		IVLength = pgp_cipher:iv_length(Cipher),
 		IVZ = <<0:IVLength/unit:8>>,
-		State = crypto:crypto_init(Cipher,Key,IVZ,[{encrypt,false}]),
-		case pgp_cipher:cipher_data(State, BlockSize, Encrypted) of
+		case pgp_cipher:decrypt_cfb(Cipher,Key,IVZ,Encrypted) of
 		    <<CipherAlgorithm,SymKey/binary>> ->
 			SymKey;
 		    _ ->
@@ -657,25 +678,60 @@ decode_packet(?USER_ID_PACKET, UserId, Context) ->
      Context#{ user_id => UserId,  user_attribute => undefined }};
 decode_packet(?COMPRESSED_PACKET, <<Algorithm,Data/binary>>, Context) ->
     Data1 = pgp_compress:decompress(Algorithm,Data),
+    ?dbg("Decompressed: Alg=~w, Data=~w\n", [Algorithm, Data1]),
     decode_packets(Data1, Context);
-decode_packet(?LITERAL_DATA_PACKET, <<Format,Data/binary>>, Context) ->
-    %% convert format=$t line-endings?
-    {{literal_data, #{ format => Format, value => Data }}, Context};
-decode_packet(?ENCRYPTED_PACKET, Data, Context) ->
+decode_packet(?LITERAL_DATA_PACKET,
+	      <<Fmt,FLen,Filename:FLen/binary,Timestamp:32,
+		Data/binary>>, Context) ->
+    DateTime = pgp_util:timestamp_to_datetime(Timestamp),
+    Format = maps:get(Fmt, #{ $b => binary, $t => text,
+			      $u => utf8, $l => local }, Fmt),
+    Packet = {literal_data, #{ format => Format, filename => Filename,
+			       date => DateTime, value => Data }},
+    {Packet, Context};
+decode_packet(?ENCRYPTED_PACKET, CData, Context) ->
     #{ cipher := Cipher, symmetric_key := SymmetricKey } = Context,
-    #{ iv_length := IVLength, block_size := BlockSize } =
-	crypto:cipher_info(Cipher),
-    IVZ = <<0:IVLength/unit:8>>,
-    State = crypto:crypto_init(Cipher,SymmetricKey,IVZ,[{encrypt,false}]),
-    Data1 = pgp_cipher:cipher_data(State,BlockSize,Data),
-    <<_:(BlockSize+2)/binary, Data2/binary>> = Data1,
-    decode_packets(Data2, Context);
+    {_Prefix,Data} = pgp_cipher:decrypt(openpgp, Cipher, undefined, 
+					CData, SymmetricKey),
+    ?dbg("encrypted: Data[~w]=~p\n", [byte_size(Data),Data]),
+    decode_packets(Data, Context);
 
-decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,Data/binary>>, Context) ->
-    %% FIXME: decrypt if secret key is available and packet is valid
-    %% then recursive decrypt 
-    {{encrypted_protected, #{ version => Version,value => Data }},
-     Context}.
+decode_packet(?ENCRYPTED_PROTECTED_PACKET, <<Version,CData/binary>>, Context) ->
+    #{ cipher := Cipher, symmetric_key := SymmetricKey } = Context,
+    BS = pgp_cipher:block_size(Cipher),
+    {Prefix,Data0} = pgp_cipher:decrypt(openpgp2,Cipher,
+					undefined,CData,SymmetricKey),
+    ?dbg("encrypted_protected: version=~w\n", [Version]),
+
+    %% FIXME PADDING = BS - (messagelen + 2 +22) rem BS???
+    %% Assume that packet is padded with zeros 22 = 20+2 (the mdc packet)
+    ?dbg("plaintext[~w] = ~p\n", [byte_size(Data0),Data0]),
+    TagHP = {Tag,1,PLen0} = packet_len(Data0),  %% length is not fixed!
+    ?dbg("packet_len=~p\n", [TagHP]),
+    MDCPacketLen = 20+2,
+    PLen = PLen0 - MDCPacketLen,
+    <<PlainText:(1+PLen)/binary,MDCData:MDCPacketLen/binary>> = Data0,
+    TagHP1 = {Tag1,HLen1,PLen1} = packet_len(MDCData),
+    ?dbg("mdc_packet_len=~p\n", [TagHP1]),
+
+    {{Tag1,MDC},<<>>} = unpack_packet(MDCData),
+    ?dbg("mdc: ~p\n", [MDC]),
+
+    %% <<Prefix:(BS+2)/binary, _/binary>> = CData,
+    MDC_Check = crypto:hash(sha, [Prefix,PlainText,16#D3,16#14]),
+    ?dbg("mdc_check: ~p\n", [MDC_Check]),
+    Valid = MDC =:= MDC_Check,
+    %% FIXME: Verify that MDC Modification Detection Code Packet is present!
+    decode_packets(PlainText, Context#{ mdc => MDC, mdc_valid => Valid });
+
+%% This packet is noramlly appended to the ENCRYPTED_PROTECTED_PACKET
+%% that may (normally) be indicated with indeterminate=3 length
+%% decoding is thus only possible when decoding ENCRYPTED_PROTECTED_PACKET
+decode_packet(?MODIFICATION_DETECTION_CODE_PACKET, <<Hash:20>>, Context) ->
+    #{ mdc := MDC } = Context,
+    { {modification_detection_code_packet,
+       #{ valid => (MDC =:= Hash),
+	  hash => Hash }}, Context }.
 
 %% version 4
 decode_public_key_4(key, KeyData, Context) ->
@@ -697,8 +753,7 @@ decode_secret_key_4(secret_key, KeyData, Context) ->
     #{ key_id := KeyID } = Key,
     {{secret_key, #{ key_id => KeyID }},
      Context#{ key_id => KeyID, KeyID => Key }};
-decode_secret_key_4(secret_subkey,KeyData, 
-		    Context = #{ key := KeyID }) ->
+decode_secret_key_4(secret_subkey, KeyData, Context = #{ key_id := KeyID }) ->
     SubKey = pgp_keys:decode_secret_key(KeyData, Context),
     #{ key_id := SubKeyID } = SubKey,
     {{secret_subkey, #{ key_id => SubKeyID, primary_key_id => KeyID },
@@ -1069,12 +1124,13 @@ pubkey_encrypt(Key, Cipher, SessionKey) ->
 	#{ type := elgamal, p := P, g := G, y := Y } ->
 	    Q = (P-1) div 2,
 	    K = rand:uniform(Q) -1,
+	    Kz = byte_size(binary:encode_unsigned(K, big)),
 	    EM = key_to_em(Cipher, SessionKey),
-	    MBin = eme_pckcs1_v1_5_encode(K, EM),
+	    MBin = eme_pckcs1_v1_5_encode(Kz, EM),
 	    M = binary:decode_unsigned(MBin, big),
 	    Gk = mpz:powm(G, K, P),
 	    MYk = (M*mpz:powm(Y, K, P)) rem P,
-	    pgp_utl:encode_mpi_list([Gk,MYk])
+	    pgp_util:encode_mpi_list([Gk,MYk])
     end.
 
 pubkey_decrypt(SecretKey, Data) ->
