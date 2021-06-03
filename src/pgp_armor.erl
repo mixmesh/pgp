@@ -9,6 +9,7 @@
 -module(pgp_armor).
 -export([decode/1]).
 -export([encode_message/1, encode_pubkey/1]).
+-export_type([decode_error_reason/0]).
 
 -define(CRC24_INIT, 16#B704CE).
 -define(CRC24_POLY, 16#1864CFB).
@@ -25,6 +26,8 @@
 
 -define(LINE_LENGTH, 72).
 -define(EKS_BANNER, "EKS pre-release").
+
+-type decode_error_reason() :: badcrc.
 
 decode(KeyText) ->
     case keylines(binary:split(KeyText, <<$\n>>, [global])) of
