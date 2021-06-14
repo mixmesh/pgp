@@ -31,8 +31,7 @@
 	  $ pem2openpgp temporary_id < .ssh/my_fancy_key  | gpg2 --import --homedir temp_gpg/
 	 
 	5 - Add the SSH key as a subkey of your GPG key. 	
-	  $ gpg2 --homedir temp_gpg  --expert --edit-key THE-KEY
-gpg> addkey
+	  $ gpg2 --homedir temp_gpg  --expert --edit-key THE-KEY gpg> addkey
 
 	6 - Export your existing GPG key with the new subkey. 
       $ gpg2 --homedir temp_gpg -a --export-secret-keys THE-KEY > my_new_gpg_key.asc

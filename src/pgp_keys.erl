@@ -12,7 +12,7 @@
 -export([decode_public_key/1]).
 -export([decode_secret_key/1, decode_secret_key/2]).
 
--export([generate_rsa_key/0, generate_rsa_key/2]).
+-export([generate_rsa_key/0, generate_rsa_key/1, generate_rsa_key/2]).
 -export([generate_dss_key/0, generate_dss_key/1]).
 -export([generate_elgamal_key/0, generate_elgamal_key/1]).
 -export([generate_mixmesh_key/0, generate_mixmesh_key/1]).
@@ -42,7 +42,10 @@
 -type private_elgamal() :: map().
 
 generate_rsa_key() ->
-    generate_rsa_key(2048, 65537).
+    generate_rsa_key(2048).
+
+generate_rsa_key(KeySize) ->
+    generate_rsa_key(KeySize, 65537).
 
 -spec generate_rsa_key(ModulusSizeInBits::integer(), 
 		       PublicExponent :: integer()) ->
@@ -173,7 +176,7 @@ encrypt_key_data(List, Context) ->
 	    CheckSum = pgp_util:checksum(Data),
 	    <<0,CheckSum:16,Data/binary>>;
 	Password ->
-	    Cipher = maps:get(cipher, Context, des_ede3_cbc),
+	    Cipher = maps:get(cipher, Context, des3),
 	    Checksum = maps:get(checksum, Context, hash),
 	    CipherAlgorithm = pgp_cipher:encode(Cipher),
 	    S2K = pgp_s2k:adjust(maps:get(s2k, Context, {simple, md5})),

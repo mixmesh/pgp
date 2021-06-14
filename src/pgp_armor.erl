@@ -8,7 +8,7 @@
 
 -module(pgp_armor).
 -export([decode/1]).
--export([encode_message/1, encode_pubkey/1]).
+-export([encode_message/1, encode_pubkey/1, encode_seckey/1]).
 -export_type([decode_error_reason/0]).
 
 -define(CRC24_INIT, 16#B704CE).
@@ -16,8 +16,8 @@
 
 -define(PGP_PUBKEY_HEADER, <<"-----BEGIN PGP PUBLIC KEY BLOCK-----">>).
 -define(PGP_PUBKEY_FOOTER, <<"-----END PGP PUBLIC KEY BLOCK-----">>).
--define(PGP_PRIKEY_HEADER, <<"-----BEGIN PGP PRIVATE KEY BLOCK-----">>).
--define(PGP_PRIKEY_FOOTER, <<"-----END PGP PRIVATE KEY BLOCK-----">>).
+-define(PGP_SECKEY_HEADER, <<"-----BEGIN PGP PRIVATE KEY BLOCK-----">>).
+-define(PGP_SECKEY_FOOTER, <<"-----END PGP PRIVATE KEY BLOCK-----">>).
 -define(PGP_MESSAGE_HEADER, <<"-----BEGIN PGP MESSAGE-----">>).
 -define(PGP_MESSAGE_FOOTER, <<"-----END PGP MESSAGE-----">>).
 
@@ -44,7 +44,7 @@ decode(KeyText) ->
 
 keylines([?PGP_PUBKEY_HEADER | Rest]) ->
     keylines(Rest, [{type,public}], [], no_sum);
-keylines([?PGP_PRIKEY_HEADER | Rest]) ->
+keylines([?PGP_SECKEY_HEADER | Rest]) ->
     keylines(Rest, [{type,private}], [], no_sum);
 keylines([?PGP_MESSAGE_HEADER | Rest]) ->
     keylines(Rest, [{type,message}], [], no_sum);
@@ -70,7 +70,7 @@ keylines([?PGP_PUBKEY_FOOTER | _], Opt, Acc, CRC) ->
 	_ ->
 	    {error, bad_footer}
     end;
-keylines([?PGP_PRIKEY_FOOTER | _], Opt, Acc, CRC) ->
+keylines([?PGP_SECKEY_FOOTER | _], Opt, Acc, CRC) ->
     case proplists:get_value(type, Opt) of
 	private ->
 	    {Opt, iolist_to_binary(lists:reverse(Acc)), CRC};
@@ -91,6 +91,11 @@ encode_pubkey(Data) ->
     [?PGP_PUBKEY_HEADER, $\n,
      encode_content(Data),
      ?PGP_PUBKEY_FOOTER, $\n].
+
+encode_seckey(Data) ->
+    [?PGP_SECKEY_HEADER, $\n,
+     encode_content(Data),
+     ?PGP_SECKEY_FOOTER, $\n].
 
 encode_content(Data) ->
     [%%?PGP_VERSION_PREFIX, ?EKS_BANNER, $\n,
