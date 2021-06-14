@@ -9,7 +9,7 @@ ERL_SOURCES=$(ASN1_SRC:%.asn1=%.erl) $(wildcard *.erl) \
 	$(YRL_SRC:%.yrl=%.erl) $(XRL_SRC:%.xrl=%.erl)
 ERL_OBJECTS=$(ERL_SOURCES:%.erl=../ebin/%.beam)
 ALL_OBJECTS=$(ERL_OBJECTS)
-ERL_MODULES=$(ERL_SOURCES:%.erl=%)
+ERL_MODULES=$(ERL_SOURCES:%.erl='%')
 comma=,
 empty=
 space = $(empty) $(empty)
@@ -38,7 +38,7 @@ clean:
 	$(ERLC) $<
 
 $(APP_TARGET): $(APP_SRC)
-	sed -e 's;{vsn,.*git};{vsn,"$(VERSION)"};' -e 's;"@@MODULES@@";$(MODULES);' $(APP_SRC) > $(APP_TARGET)
+	sed -e 's;{vsn,.*git};{vsn,"$(VERSION)"};' -e "s;@@MODULES@@;$(MODULES);" $(APP_SRC) > $(APP_TARGET)
 
 .%.d: ;
 
