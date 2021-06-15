@@ -22,7 +22,7 @@
 %% output secret key (to file) and also the password used to encrypt
 %% the secret key. 
 
-generate_and_upload(Params = #{ email := _Email }) ->
+generate_and_upload(Params = #{ uid := _UID }) ->
     {Key,SubKey} = generate(Params),
     BaseUrl = maps:get(url, Params, "https://mixmesh.se:11371"),
     %% encrypt secret key and print
@@ -89,7 +89,10 @@ create(BaseUrl, Ticket, ArmorKey) ->
     case rester_http:wpost(Url,[{'Content-Type', "application/json"}],
 			   #{ <<"sessionTicket">> => Ticket,
 			      <<"key">> => ArmorKey }) of
+	{ok,#http_response{ status = 200 }, <<>> } ->
+	    ok;
 	{ok,#http_response{ status = 200 },Response } ->
+	    io:format("Response = ~p\n", [Response]),
 	    case jsone:decode(Response) of
 		#{ <<"errorMessage">> := Error } ->
 		    {error, Error};
@@ -120,12 +123,12 @@ generate(Params) ->
 make_sec_key(Params, Key, SubKey, Context) ->
     KeyID = maps:get(key_id, Key),
     SubKeyID = maps:get(key_id, SubKey),
-    Email = maps:get(email, Params),
-    Nym = maps:get(nym, Params, Email),
+    Uid = maps:get(uid, Params),
+    Nym = maps:get(nym, Params, "annonym"),
     Content = 
 	[
 	 {secret_key, #{ key_id => KeyID }},
-	 {user_id, #{ value => iolist_to_binary(Email) }},
+	 {user_id, #{ value => iolist_to_binary(Uid) }},
 	 {user_id, #{ value => iolist_to_binary(["MM-NYM:",Nym])}},
 	 {signature, #{ signature_type => 16#13,  %% certification
 			hash_algorithm => sha512,
@@ -150,12 +153,12 @@ make_sec_key(Params, Key, SubKey, Context) ->
 make_pub_key(Params, Key, SubKey, Context) ->
     KeyID = maps:get(key_id, Key),
     SubKeyID = maps:get(key_id, SubKey),
-    Email = maps:get(email, Params),
-    Nym = maps:get(nym, Params, Email),
+    Uid = maps:get(uid, Params),
+    Nym = maps:get(nym, Params, "annonym"),
     Content = 
 	[
 	 {key, #{ key_id => KeyID }},
-	 {user_id, #{ value => iolist_to_binary(Email) }},
+	 {user_id, #{ value => iolist_to_binary(Uid) }},
 	 {user_id, #{ value => iolist_to_binary(["MM-NYM:",Nym])}},
 	 {signature, #{ signature_type => 16#13,  %% certification
 			hash_algorithm => sha512,
